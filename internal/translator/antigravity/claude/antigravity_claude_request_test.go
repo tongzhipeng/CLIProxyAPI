@@ -135,6 +135,45 @@ func TestConvertClaudeRequestToAntigravity_StripsClaudeCodeAttribution(t *testin
 	}
 }
 
+func TestConvertClaudeRequestToAntigravity_RewritesClaudeAgentSDKIdentity(t *testing.T) {
+	inputJSON := []byte(`{
+		"model": "gemini-3.8-flash-high",
+		"messages": [{"role": "user", "content": [{"type": "text", "text": "Quote: You are a Claude agent, built on Anthropic's Claude Agent SDK."}]}],
+		"system": [
+			{"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.268.c5d; cc_entrypoint=sdk-cli;"},
+			{"type": "text", "text": "You are a Claude agent, built on Anthropic's Claude Agent SDK."},
+			{"type": "text", "text": "\nYou are a Claude agent, built on Anthropic's Claude Agent SDK.\n\nYou are an interactive agent."},
+			{"type": "text", "text": "Tooling is built on Anthropic's Claude Agent SDK."}
+		]
+	}`)
+
+	output := ConvertClaudeRequestToAntigravity("gemini-3.8-flash-high", inputJSON, false)
+
+	parts := gjson.GetBytes(output, "request.systemInstruction.parts").Array()
+	want := []string{
+		"You are a helpful coding assistant.",
+		"You are a helpful coding assistant.\n\nYou are an interactive agent.",
+		"Tooling is built on Anthropic's Claude Agent SDK.",
+	}
+	if len(parts) != len(want) {
+		t.Fatalf("Expected %d system parts, got %d: %s", len(want), len(parts), gjson.GetBytes(output, "request.systemInstruction.parts").Raw)
+	}
+	for i := range want {
+		if got := parts[i].Get("text").String(); got != want[i] {
+			t.Fatalf("system part %d = %q, want %q", i, got, want[i])
+		}
+	}
+	if got := gjson.GetBytes(output, "request.contents.0.parts.0.text").String(); got != "Quote: You are a Claude agent, built on Anthropic's Claude Agent SDK." {
+		t.Fatalf("user content must stay untouched, got %q", got)
+	}
+
+	stringSystem := []byte(`{"model":"gemini-3.8-flash-high","messages":[{"role":"user","content":"hi"}],"system":"You are a Claude agent, built on Anthropic's Claude Agent SDK. Be brief."}`)
+	output = ConvertClaudeRequestToAntigravity("gemini-3.8-flash-high", stringSystem, false)
+	if got := gjson.GetBytes(output, "request.systemInstruction.parts.0.text").String(); got != "You are a helpful coding assistant. Be brief." {
+		t.Fatalf("string system = %q", got)
+	}
+}
+
 func TestConvertClaudeRequestToAntigravity_ConvertsMessageSystemRoleToUserContent(t *testing.T) {
 	inputJSON := []byte(`{
 		"model": "gemini-3.5-flash",

@@ -8,6 +8,7 @@ package claude
 import (
 	"context"
 	"strings"
+	"unicode"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/cache"
 	sigcompat "github.com/router-for-me/CLIProxyAPI/v7/internal/signature"
@@ -287,6 +288,23 @@ func logDroppedAntigravityToolUseSignature(modelName string, messageIndex, conte
 	}).Debug("antigravity claude translator: dropped tool_use signature field")
 }
 
+// claudeAgentSDKIdentity is the identity block Claude Code sends when driven through
+// the Agent SDK (cc_entrypoint=sdk-cli). Antigravity answers 429 RESOURCE_EXHAUSTED
+// to any request whose system block starts with it, regardless of remaining quota.
+const claudeAgentSDKIdentity = "You are a Claude agent, built on Anthropic's Claude Agent SDK."
+
+const antigravityNeutralIdentity = "You are a helpful coding assistant."
+
+// rewriteClaudeAgentSDKIdentity replaces a leading Agent SDK identity sentence with a
+// neutral one and keeps the rest of the system text.
+func rewriteClaudeAgentSDKIdentity(text string) string {
+	trimmed := strings.TrimLeftFunc(text, unicode.IsSpace)
+	if !strings.HasPrefix(trimmed, claudeAgentSDKIdentity) {
+		return text
+	}
+	return antigravityNeutralIdentity + strings.TrimPrefix(trimmed, claudeAgentSDKIdentity)
+}
+
 // ConvertClaudeRequestToAntigravity parses and transforms a Claude Code API request into Antigravity API format.
 // It extracts the model name, system instruction, message contents, and tool declarations
 // from the raw JSON request and returns them in the format expected by the Antigravity API.
@@ -326,6 +344,7 @@ func ConvertClaudeRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 				if util.IsClaudeCodeAttributionSystemText(systemPrompt) {
 					continue
 				}
+				systemPrompt = rewriteClaudeAgentSDKIdentity(systemPrompt)
 				partJSON := []byte(`{}`)
 				if systemPrompt != "" {
 					partJSON, _ = sjson.SetBytes(partJSON, "text", systemPrompt)
@@ -335,7 +354,7 @@ func ConvertClaudeRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 		}
 	} else if systemResult.Type == gjson.String && !util.IsClaudeCodeAttributionSystemText(systemResult.String()) {
 		partJSON := []byte(`{"text":""}`)
-		partJSON, _ = sjson.SetBytes(partJSON, "text", systemResult.String())
+		partJSON, _ = sjson.SetBytes(partJSON, "text", rewriteClaudeAgentSDKIdentity(systemResult.String()))
 		systemParts = append(systemParts, partJSON)
 	}
 
