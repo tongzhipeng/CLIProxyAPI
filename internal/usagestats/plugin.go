@@ -57,6 +57,8 @@ type entry struct {
 	TtftMs            int64                    `json:"ttft_ms,omitempty"`
 	ErrorMessage      string                   `json:"error_message,omitempty"`
 	AccountingVersion int                      `json:"accounting_version"`
+	Endpoint          string                   `json:"endpoint,omitempty"`
+	ReasoningEffort   string                   `json:"reasoning_effort,omitempty"`
 	TokenBreakdown    coreusage.TokenBreakdown `json:"token_breakdown"`
 }
 
@@ -127,9 +129,9 @@ func (p *recordPlugin) HandleUsage(ctx context.Context, record coreusage.Record)
 		statusCode = 200
 	}
 
-	account := strings.TrimSpace(record.AuthID)
+	account := CleanAccount(record.AuthID)
 	if account == "" {
-		account = strings.TrimSpace(record.AuthIndex)
+		account = CleanAccount(record.AuthIndex)
 	}
 	if account == "" {
 		account = "unknown"
@@ -152,6 +154,11 @@ func (p *recordPlugin) HandleUsage(ctx context.Context, record coreusage.Record)
 		errMsg = errMsg[:256]
 	}
 
+	effort := strings.TrimSpace(record.ReasoningEffort)
+	if effort == "" {
+		effort = strings.TrimSpace(coreusage.ReasoningEffortFromContext(ctx))
+	}
+
 	e := entry{
 		Timestamp:         ts,
 		Provider:          nonEmpty(record.Provider, "unknown"),
@@ -169,6 +176,8 @@ func (p *recordPlugin) HandleUsage(ctx context.Context, record coreusage.Record)
 		TtftMs:            ttftMs,
 		ErrorMessage:      errMsg,
 		AccountingVersion: coreusage.TokenAccountingSchemaVersion,
+		Endpoint:          internallogging.GetEndpoint(ctx),
+		ReasoningEffort:   effort,
 		TokenBreakdown:    detail.TokenBreakdown,
 	}
 

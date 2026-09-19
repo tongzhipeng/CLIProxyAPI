@@ -93,6 +93,7 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/usage-stats", s.mgmt.GetUsageStats)
 		mgmt.GET("/usage-timeseries", s.mgmt.GetUsageTimeseries)
 		mgmt.GET("/usage-records", s.mgmt.GetUsageRecords)
+		mgmt.GET("/usage-breakdown", s.mgmt.GetUsageBreakdown)
 
 		mgmt.GET("/gemini-api-key", s.mgmt.GetGeminiKeys)
 		mgmt.PUT("/gemini-api-key", s.mgmt.PutGeminiKeys)

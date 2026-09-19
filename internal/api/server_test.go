@@ -3096,3 +3096,45 @@ func assertSerializedCPAWebSearch(t *testing.T, model map[string]any, want bool)
 		t.Fatalf("model %v web_search = %#v, want %v", model["slug"], capabilities["web_search"], want)
 	}
 }
+
+func TestManagementUsageEndpointsAuthAndRouting(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "test-management-key")
+	server := newTestServer(t)
+
+	endpoints := []string{
+		"/v0/management/usage-stats",
+		"/v0/management/usage-timeseries",
+		"/v0/management/usage-records",
+		"/v0/management/usage-breakdown?dimension=model",
+	}
+
+	for _, ep := range endpoints {
+		t.Run(ep, func(t *testing.T) {
+			// 1. Missing auth
+			noAuthReq := httptest.NewRequest(http.MethodGet, ep, nil)
+			noAuthRR := httptest.NewRecorder()
+			server.engine.ServeHTTP(noAuthRR, noAuthReq)
+			if noAuthRR.Code != http.StatusUnauthorized {
+				t.Fatalf("%s without auth got status %d, want 401", ep, noAuthRR.Code)
+			}
+
+			// 2. Wrong auth
+			badAuthReq := httptest.NewRequest(http.MethodGet, ep, nil)
+			badAuthReq.Header.Set("Authorization", "Bearer wrong-key")
+			badAuthRR := httptest.NewRecorder()
+			server.engine.ServeHTTP(badAuthRR, badAuthReq)
+			if badAuthRR.Code != http.StatusUnauthorized {
+				t.Fatalf("%s with bad auth got status %d, want 401", ep, badAuthRR.Code)
+			}
+
+			// 3. Correct auth
+			authReq := httptest.NewRequest(http.MethodGet, ep, nil)
+			authReq.Header.Set("Authorization", "Bearer test-management-key")
+			authRR := httptest.NewRecorder()
+			server.engine.ServeHTTP(authRR, authReq)
+			if authRR.Code != http.StatusOK {
+				t.Fatalf("%s with valid auth got status %d, want 200, body=%s", ep, authRR.Code, authRR.Body.String())
+			}
+		})
+	}
+}

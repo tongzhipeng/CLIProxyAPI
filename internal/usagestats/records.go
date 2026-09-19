@@ -43,19 +43,27 @@ type UsageRecord struct {
 	TtftMs            int64                    `json:"ttft_ms,omitempty"`
 	ErrorMessage      string                   `json:"error_message,omitempty"`
 	AccountingVersion int                      `json:"accounting_version"`
+	Endpoint          string                   `json:"endpoint,omitempty"`
+	ReasoningEffort   string                   `json:"reasoning_effort,omitempty"`
 	TokenBreakdown    coreusage.TokenBreakdown `json:"token_breakdown"`
 }
 
 // RecordsPage is a reverse-chronological page of usage records.
 type RecordsPage struct {
-	Records []UsageRecord `json:"records"`
-	HasMore bool          `json:"has_more"`
-	NextOff int           `json:"next_offset"`
+	Records    []UsageRecord `json:"records"`
+	HasMore    bool          `json:"has_more"`
+	NextOff    int           `json:"next_offset"`
+	SnapshotID string        `json:"snapshot_id,omitempty"`
 }
 
 // QueryRecords scans append-only daily files newest-first and returns a bounded
 // reverse-chronological page without loading an entire file into memory.
 func QueryRecords(dir string, from, to time.Time, filter RecordFilter, offset, limit int) (RecordsPage, error) {
+	return QueryRecordsWithOptions(dir, from, to, filter, offset, limit, nil)
+}
+
+// QueryRecordsWithOptions performs reverse-chronological scanning bounded by optional snapshot file boundaries.
+func QueryRecordsWithOptions(dir string, from, to time.Time, filter RecordFilter, offset, limit int, boundaries map[string]int64) (RecordsPage, error) {
 	if to.Before(from) {
 		from, to = to, from
 	}
@@ -80,7 +88,17 @@ func QueryRecords(dir string, from, to time.Time, filter RecordFilter, offset, l
 	}
 	remaining := offset
 	for day := endDay; !day.Before(startDay); day = day.AddDate(0, 0, -1) {
-		path := filepath.Join(dir, "usage-"+day.Format(dateLayout)+".jsonl")
+		dateStr := day.Format(dateLayout)
+		var maxOffset int64
+		if boundaries != nil {
+			boundary, exists := boundaries[dateStr]
+			if !exists || boundary <= 0 {
+				continue
+			}
+			maxOffset = boundary
+		}
+
+		path := filepath.Join(dir, "usage-"+dateStr+".jsonl")
 		file, errOpen := os.Open(path)
 		if errOpen != nil {
 			if os.IsNotExist(errOpen) {
@@ -89,11 +107,12 @@ func QueryRecords(dir string, from, to time.Time, filter RecordFilter, offset, l
 			return RecordsPage{}, fmt.Errorf("usagestats: open %s: %w", path, errOpen)
 		}
 
-		stop, errScan := scanFileReverse(file, func(raw []byte) bool {
+		stop, errScan := scanFileReverse(file, maxOffset, func(raw []byte) bool {
 			var e entry
 			if errUnmarshal := json.Unmarshal(raw, &e); errUnmarshal != nil {
 				return false
 			}
+			e.Account = CleanAccount(e.Account)
 			if e.Timestamp.Before(from) || e.Timestamp.After(to) || !matchesFilter(e, filter) {
 				return false
 			}
@@ -101,13 +120,13 @@ func QueryRecords(dir string, from, to time.Time, filter RecordFilter, offset, l
 				remaining--
 				return false
 			}
-			result.Records = append(result.Records, toUsageRecord(e))
-			result.NextOff++
-			if len(result.Records) >= limit {
-				result.HasMore = true
-				return true
+			if len(result.Records) < limit {
+				result.Records = append(result.Records, toUsageRecord(e))
+				result.NextOff++
+				return false
 			}
-			return false
+			result.HasMore = true
+			return true
 		})
 		closeErr := file.Close()
 		if errScan != nil {
@@ -130,7 +149,7 @@ func matchesFilter(e entry, filter RecordFilter) bool {
 	if filter.Model != "" && e.Model != filter.Model {
 		return false
 	}
-	if filter.Account != "" && e.Account != filter.Account {
+	if filter.Account != "" && CleanAccount(e.Account) != CleanAccount(filter.Account) {
 		return false
 	}
 	return filter.Failed == nil || e.Failed == *filter.Failed
@@ -153,16 +172,24 @@ func toUsageRecord(e entry) UsageRecord {
 		TtftMs:            e.TtftMs,
 		ErrorMessage:      e.ErrorMessage,
 		AccountingVersion: e.AccountingVersion,
+		Endpoint:          e.Endpoint,
+		ReasoningEffort:   e.ReasoningEffort,
 		TokenBreakdown:    e.TokenBreakdown,
 	}
 }
 
-func scanFileReverse(file *os.File, visit func([]byte) bool) (bool, error) {
-	info, errStat := file.Stat()
-	if errStat != nil {
-		return false, errStat
+func scanFileReverse(file *os.File, maxOffset int64, visit func([]byte) bool) (bool, error) {
+	var position int64
+	if maxOffset > 0 {
+		position = maxOffset
+	} else {
+		info, errStat := file.Stat()
+		if errStat != nil {
+			return false, errStat
+		}
+		position = info.Size()
 	}
-	position := info.Size()
+
 	carry := []byte(nil)
 	buffer := make([]byte, reverseReadSize)
 

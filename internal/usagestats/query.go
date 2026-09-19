@@ -1,11 +1,7 @@
 package usagestats
 
 import (
-	"bufio"
-	"encoding/json"
 	"fmt"
-	"os"
-	"path/filepath"
 	"sort"
 	"time"
 )
@@ -60,10 +56,12 @@ func QueryDaily(dir string, from, to time.Time) ([]DailyModelStats, error) {
 
 	agg := make(map[statsKey]*DailyModelStats)
 
-	for day := from; !day.After(to); day = day.AddDate(0, 0, 1) {
-		if err := aggregateFile(dir, day, agg); err != nil {
-			return nil, err
-		}
+	err := forEachEntry(dir, from, to, func(day time.Time, e entry) bool {
+		addEntry(agg, day.Format(dateLayout), e)
+		return false
+	})
+	if err != nil {
+		return nil, err
 	}
 
 	out := make([]DailyModelStats, 0, len(agg))
@@ -83,43 +81,6 @@ func QueryDaily(dir string, from, to time.Time) ([]DailyModelStats, error) {
 		return out[i].Account < out[j].Account
 	})
 	return out, nil
-}
-
-func aggregateFile(dir string, day time.Time, agg map[statsKey]*DailyModelStats) error {
-	dateStr := day.Format(dateLayout)
-	path := filepath.Join(dir, "usage-"+dateStr+".jsonl")
-
-	f, errOpen := os.Open(path)
-	if errOpen != nil {
-		if os.IsNotExist(errOpen) {
-			return nil
-		}
-		return fmt.Errorf("usagestats: open %s: %w", path, errOpen)
-	}
-	defer func() {
-		if errClose := f.Close(); errClose != nil {
-			// Only a read-path resource leak warning; do not fail the query for it.
-			_ = errClose
-		}
-	}()
-
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	for scanner.Scan() {
-		line := scanner.Bytes()
-		if len(line) == 0 {
-			continue
-		}
-		var e entry
-		if err := json.Unmarshal(line, &e); err != nil {
-			continue
-		}
-		addEntry(agg, dateStr, e)
-	}
-	if err := scanner.Err(); err != nil {
-		return fmt.Errorf("usagestats: scan %s: %w", path, err)
-	}
-	return nil
 }
 
 func addEntry(agg map[statsKey]*DailyModelStats, dateStr string, e entry) {

@@ -1,6 +1,7 @@
 package management
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -73,24 +74,71 @@ func (h *Handler) GetUsageRecords(c *gin.Context) {
 		failed = &value
 	}
 
-	page, err := usagestats.QueryRecords(usagestats.Dir(h.logDirectory()), from, to, usagestats.RecordFilter{
+	snapshotParam := strings.TrimSpace(c.Query("snapshot"))
+	var snapshotID string
+	var boundaries map[string]int64
+
+	filter := usagestats.RecordFilter{
 		Provider: c.Query("provider"),
 		Model:    c.Query("model"),
 		Account:  c.Query("account"),
 		Failed:   failed,
-	}, offset, limit)
+	}
+
+	statsDir := usagestats.Dir(h.logDirectory())
+
+	if snapshotParam == "new" {
+		if offset != 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "snapshot=new requires offset=0"})
+			return
+		}
+		snap, errSnap := usagestats.DefaultSnapshotStore.CreateSnapshot(statsDir, from, to, filter)
+		if errSnap != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": errSnap.Error()})
+			return
+		}
+		snapshotID = snap.ID
+		boundaries = snap.Boundaries
+	} else if snapshotParam != "" {
+		snap, errSnap := usagestats.DefaultSnapshotStore.GetSnapshot(snapshotParam, statsDir, from, to, filter)
+		if errSnap != nil {
+			if errors.Is(errSnap, usagestats.ErrSnapshotExpired) {
+				c.JSON(http.StatusConflict, gin.H{"error": "snapshot expired or not found"})
+				return
+			}
+			if errors.Is(errSnap, usagestats.ErrSnapshotCorrupted) {
+				c.JSON(http.StatusConflict, gin.H{"error": "snapshot file corrupted or truncated"})
+				return
+			}
+			if errors.Is(errSnap, usagestats.ErrSnapshotMismatch) {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "snapshot parameters mismatch"})
+				return
+			}
+			c.JSON(http.StatusBadRequest, gin.H{"error": errSnap.Error()})
+			return
+		}
+		snapshotID = snap.ID
+		boundaries = snap.Boundaries
+	}
+
+	page, err := usagestats.QueryRecordsWithOptions(statsDir, from, to, filter, offset, limit, boundaries)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{
+	resp := gin.H{
 		"from":        from.Format(time.RFC3339Nano),
 		"to":          to.Format(time.RFC3339Nano),
 		"records":     page.Records,
 		"has_more":    page.HasMore,
 		"next_offset": page.NextOff,
-	})
+	}
+	if snapshotID != "" {
+		resp["snapshot_id"] = snapshotID
+	}
+
+	c.JSON(http.StatusOK, resp)
 }
 
 func parseNonNegativeInt(raw string, fallback int) (int, error) {

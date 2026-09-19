@@ -10,31 +10,24 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/usagestats"
 )
 
-// GetUsageTimeseries returns zero-filled usage buckets aligned to the requested
-// interval and timezone.
-func (h *Handler) GetUsageTimeseries(c *gin.Context) {
+// GetUsageBreakdown returns aggregated usage metrics grouped by dimension.
+func (h *Handler) GetUsageBreakdown(c *gin.Context) {
 	if h == nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "handler not initialized"})
 		return
 	}
 
-	step := strings.ToLower(strings.TrimSpace(c.DefaultQuery("step", "hour")))
-	if step != "hour" && step != "day" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid step, expected hour or day"})
-		return
-	}
-
-	rangeMode := strings.ToLower(strings.TrimSpace(c.DefaultQuery("range_mode", "bucket")))
-	if rangeMode != "bucket" && rangeMode != "exact" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid range_mode, expected bucket or exact"})
+	dimension := strings.ToLower(strings.TrimSpace(c.Query("dimension")))
+	switch dimension {
+	case "model", "endpoint", "provider", "account":
+	default:
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid dimension, expected model, endpoint, provider, or account"})
 		return
 	}
 
 	to := time.Now().UTC()
 	from := to.Add(-24 * time.Hour)
-	if step == "day" {
-		from = to.AddDate(0, 0, -7)
-	}
+
 	var err error
 	if raw := c.Query("from"); raw != "" {
 		from, err = parseUsageTime(raw)
@@ -52,17 +45,9 @@ func (h *Handler) GetUsageTimeseries(c *gin.Context) {
 	}
 
 	if c.Query("from") != "" && c.Query("to") == "" {
-		if step == "day" {
-			to = from.AddDate(0, 0, 7)
-		} else {
-			to = from.Add(24 * time.Hour)
-		}
+		to = from.Add(24 * time.Hour)
 	} else if c.Query("from") == "" && c.Query("to") != "" {
-		if step == "day" {
-			from = to.AddDate(0, 0, -7)
-		} else {
-			from = to.Add(-24 * time.Hour)
-		}
+		from = to.Add(-24 * time.Hour)
 	}
 
 	if from.After(to) {
@@ -70,21 +55,20 @@ func (h *Handler) GetUsageTimeseries(c *gin.Context) {
 		return
 	}
 
-	buckets, err := usagestats.QueryTimeseriesWithOptions(usagestats.Dir(h.logDirectory()), from, to, step, usagestats.Filter{
+	rows, err := usagestats.QueryBreakdown(usagestats.Dir(h.logDirectory()), from, to, dimension, usagestats.Filter{
 		Provider: c.Query("provider"),
 		Model:    c.Query("model"),
 		Account:  c.Query("account"),
-	}, rangeMode)
+	})
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"from":       from.Format(time.RFC3339Nano),
-		"to":         to.Format(time.RFC3339Nano),
-		"step":       step,
-		"range_mode": rangeMode,
-		"buckets":    buckets,
+		"from":      from.Format(time.RFC3339Nano),
+		"to":        to.Format(time.RFC3339Nano),
+		"dimension": dimension,
+		"rows":      rows,
 	})
 }

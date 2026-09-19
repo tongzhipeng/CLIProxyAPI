@@ -91,8 +91,8 @@ func TestHandleUsageEnabledWritesOneLineWithExpectedFields(t *testing.T) {
 	if e.Model != "gemini-3.8-flash-high" {
 		t.Errorf("model = %q, want gemini-3.8-flash-high", e.Model)
 	}
-	if e.Account != "antigravity-kevin.lee.rowan@gmail.com.json" {
-		t.Errorf("account = %q, want auth id", e.Account)
+	if e.Account != "antigravity-kevin.lee.rowan@gmail.com" {
+		t.Errorf("account = %q, want auth id without .json", e.Account)
 	}
 	if e.Failed {
 		t.Errorf("failed = true, want false")
