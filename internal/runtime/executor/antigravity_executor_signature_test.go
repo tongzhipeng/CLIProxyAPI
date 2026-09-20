@@ -905,8 +905,10 @@ func TestAntigravityExecutorCountTokensReconstructsCompactedClaudeToolCall(t *te
 	if len(upstreamBody) == 0 {
 		t.Fatal("countTokens upstream body was not captured")
 	}
+	// The request declares tools, so the count path folds them into a synthetic
+	// leading user turn; that turn also satisfies the leading-user policy.
 	leadingText := gjson.GetBytes(upstreamBody, "request.contents.0.parts.0.text")
-	if gjson.GetBytes(upstreamBody, "request.contents.0.role").String() != "user" || !leadingText.Exists() || leadingText.String() != "" {
+	if gjson.GetBytes(upstreamBody, "request.contents.0.role").String() != "user" || !leadingText.Exists() {
 		t.Fatalf("synthetic leading user missing after replay insert: %s", upstreamBody)
 	}
 	call := gjson.GetBytes(upstreamBody, "request.contents.1.parts.0")

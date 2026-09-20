@@ -16,6 +16,7 @@ import (
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
 // CountTokens counts tokens for the given request using the Antigravity API.
@@ -62,7 +63,10 @@ func (e *AntigravityExecutor) CountTokens(ctx context.Context, auth *cliproxyaut
 	if errReplay != nil {
 		return cliproxyexecutor.Response{}, errReplay
 	}
-	payload = ensureAntigravityGeminiLeadingUserContent(baseModel, preparedPayload)
+	// Fold before the leading-user normalization: the synthetic prompt turn is a
+	// user turn, so Gemini targets need no extra empty user turn in front of it.
+	payload = foldAntigravityCountTokensPromptIntoContents(preparedPayload)
+	payload = ensureAntigravityGeminiLeadingUserContent(baseModel, payload)
 
 	payload = helps.DeleteJSONField(payload, "project")
 	payload = helps.DeleteJSONField(payload, "model")
@@ -150,4 +154,54 @@ func (e *AntigravityExecutor) CountTokens(ctx context.Context, auth *cliproxyaut
 		}
 	}
 	return cliproxyexecutor.Response{}, sErr
+}
+
+// foldAntigravityCountTokensPromptIntoContents rewrites the count-only payload so
+// the upstream /v1internal:countTokens endpoint sees everything that the
+// generate path bills for.
+//
+// Verified against the real endpoint (2026-09-20): it tokenizes only
+// request.contents and silently ignores request.systemInstruction and
+// request.tools, so a request with a large system prompt and a short user
+// message came back as totalTokens=1. Folding the system parts, and a JSON
+// rendering of the tool declarations, into a synthetic leading user turn makes
+// the returned count additive with the counted contents (system text counted
+// as user text measured +1 token). The tool declarations are an
+// approximation: upstream tool-token accounting is not exposed by the endpoint.
+func foldAntigravityCountTokensPromptIntoContents(payload []byte) []byte {
+	systemParts := gjson.GetBytes(payload, "request.systemInstruction.parts")
+	tools := gjson.GetBytes(payload, "request.tools")
+
+	parts := make([]string, 0, 4)
+	if systemParts.IsArray() {
+		for _, part := range systemParts.Array() {
+			parts = append(parts, part.Raw)
+		}
+	}
+	if tools.Exists() {
+		toolPart, errTool := sjson.SetBytes([]byte(`{"text":""}`), "text", tools.Raw)
+		if errTool == nil {
+			parts = append(parts, string(toolPart))
+		}
+	}
+	if len(parts) == 0 {
+		return payload
+	}
+
+	synthetic := []byte(`{"role":"user","parts":[` + strings.Join(parts, ",") + `]}`)
+	contents := gjson.GetBytes(payload, "request.contents")
+	items := make([]string, 0, 1+len(contents.Array()))
+	items = append(items, string(synthetic))
+	if contents.IsArray() {
+		for _, content := range contents.Array() {
+			items = append(items, content.Raw)
+		}
+	}
+	out, errSet := sjson.SetRawBytes(payload, "request.contents", []byte("["+strings.Join(items, ",")+"]"))
+	if errSet != nil {
+		return payload
+	}
+	out = helps.DeleteJSONField(out, "request.systemInstruction")
+	out = helps.DeleteJSONField(out, "request.tools")
+	return out
 }
