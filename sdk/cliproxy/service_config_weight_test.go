@@ -21,6 +21,20 @@ func TestWeightedRoundRobinRoutingSelector(t *testing.T) {
 	}
 }
 
+func TestQuotaResetFirstRoutingSelector(t *testing.T) {
+	for _, input := range []string{"quota-reset-first", "QuotaResetFirst", "reset-first", "qrf"} {
+		state := normalizedRoutingRuntimeState(&internalconfig.Config{
+			Routing: internalconfig.RoutingConfig{Strategy: input},
+		})
+		if state.strategy != "quota-reset-first" {
+			t.Fatalf("strategy(%q) = %q, want quota-reset-first", input, state.strategy)
+		}
+		if _, ok := newRoutingSelector(state).(*coreauth.QuotaResetFirstSelector); !ok {
+			t.Fatalf("selector type = %T, want *auth.QuotaResetFirstSelector", newRoutingSelector(state))
+		}
+	}
+}
+
 func TestServiceRejectsInvalidCredentialWeightConfigCommit(t *testing.T) {
 	originalCfg := &internalconfig.Config{}
 	service := &Service{cfg: originalCfg}
