@@ -182,7 +182,8 @@ type QuotaState struct {
 	// ObservedAt is the time the current Signals snapshot was observed.
 	ObservedAt time.Time `json:"observed_at,omitempty"`
 	// Signals stores bounded, provider-specific quota watermark values observed
-	// from upstream response headers or websocket quota events. It is a snapshot
+	// from upstream response headers, websocket quota events, or Antigravity
+	// model quota probes. It is a snapshot
 	// of one upstream response, not an accumulation across responses, so an
 	// expired watermark cannot linger after the response that produced it.
 	// Cooldown transitions must use applyCooldownFields so they cannot replace

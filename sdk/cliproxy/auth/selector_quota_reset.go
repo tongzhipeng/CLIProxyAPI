@@ -11,6 +11,7 @@ import (
 
 // QuotaResetFirstSelector prefers the available credential whose longest observed
 // quota window resets soonest, so quota that would expire unused is consumed first.
+// Antigravity uses the requested model bucket from active quota probes.
 // Credentials without a future reset observation keep fill-first order after them.
 type QuotaResetFirstSelector struct{}
 
@@ -26,12 +27,53 @@ func (s *QuotaResetFirstSelector) Pick(ctx context.Context, provider, model stri
 	picked := available[0]
 	var pickedReset time.Time
 	for _, candidate := range available {
-		reset, ok := quotaWindowResetAt(candidate.Quota, now)
+		reset, ok := quotaResetForModel(ctx, candidate, model, now)
 		if ok && (pickedReset.IsZero() || reset.Before(pickedReset)) {
 			picked, pickedReset = candidate, reset
 		}
 	}
 	return picked, nil
+}
+
+// quotaResetModelsKey carries the manager's credential-aware alias resolution.
+type quotaResetModelsKey struct{}
+
+func (m *Manager) withQuotaResetModels(ctx context.Context, selector Selector, model string, auths []*Auth) context.Context {
+	if affinity, ok := selector.(*SessionAffinitySelector); ok {
+		selector = affinity.fallback
+	}
+	if _, ok := selector.(*QuotaResetFirstSelector); !ok {
+		return ctx
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	models := make(map[string]string, len(auths))
+	for _, a := range auths {
+		models[a.ID] = m.selectionModelKeyForAuth(a, model)
+	}
+	return context.WithValue(ctx, quotaResetModelsKey{}, models)
+}
+
+func quotaResetForModel(ctx context.Context, a *Auth, model string, now time.Time) (time.Time, bool) {
+	model = canonicalModelKey(rewriteModelForAuth(model, a))
+	if ctx != nil {
+		if models, ok := ctx.Value(quotaResetModelsKey{}).(map[string]string); ok {
+			model = models[a.ID]
+		}
+	}
+	if state := a.ModelStates[model]; state != nil {
+		q := state.Quota
+		if raw := q.Signals["reset_time"]; raw != "" {
+			// Active probes can fail while an old reset remains in the future.
+			if q.ObservedAt.IsZero() || now.Sub(q.ObservedAt) > 10*time.Minute {
+				return time.Time{}, false
+			}
+			reset, ok := firstQuotaSignalTime(q.Signals, "reset_time")
+			return reset, ok && reset.After(now)
+		}
+	}
+	return quotaWindowResetAt(a.Quota, now)
 }
 
 // quotaWindowResetAt reports when the longest observed quota window resets.

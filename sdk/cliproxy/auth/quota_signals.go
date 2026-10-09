@@ -38,6 +38,10 @@ func (q *QuotaState) ObserveResponseHeadersForProvider(provider string, headers 
 	if q == nil {
 		return false
 	}
+	// Antigravity snapshots come from retrieveUserQuota, not generation headers.
+	if strings.EqualFold(strings.TrimSpace(provider), "antigravity") && q.Signals["reset_time"] != "" {
+		return false
+	}
 	if !ProviderSupportsQuotaObservation(provider) {
 		return q.ClearObservationSignals()
 	}

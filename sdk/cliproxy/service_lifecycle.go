@@ -207,6 +207,21 @@ func (s *Service) Run(ctx context.Context) error {
 
 	s.registerModelRefreshCallback()
 
+	if !homeEnabled {
+		quotaCtx, quotaCancel := context.WithCancel(ctx)
+		quotaTicker := time.NewTicker(time.Minute)
+		quotaDone := make(chan struct{})
+		go func() {
+			defer close(quotaDone)
+			s.runAntigravityQuotaRefresh(quotaCtx, quotaTicker.C)
+		}()
+		defer func() {
+			quotaCancel()
+			quotaTicker.Stop()
+			<-quotaDone
+		}()
+	}
+
 	select {
 	case <-ctx.Done():
 		log.Debug("service context cancelled, shutting down...")

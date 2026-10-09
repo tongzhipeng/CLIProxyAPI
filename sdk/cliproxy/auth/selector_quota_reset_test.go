@@ -6,6 +6,9 @@ import (
 	"testing"
 	"time"
 
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
 
@@ -142,5 +145,84 @@ func TestManagerQuotaResetFirstSelector_UsesObservedSignals(t *testing.T) {
 	}
 	if got == nil || got.ID != "auth-b" {
 		t.Fatalf("pickNext() auth = %v, want auth-b", got)
+	}
+}
+
+func TestQuotaResetFirstSelector_AntigravityModelScope(t *testing.T) {
+	now := time.Now()
+	a := quotaResetTestAuth("a", nil, now)
+	b := quotaResetTestAuth("b", nil, now)
+	a.ModelStates = map[string]*ModelState{
+		"gemini-test": {Status: StatusActive, Quota: QuotaState{ObservedAt: now, Signals: map[string]string{"reset_time": now.Add(4 * time.Hour).Format(time.RFC3339)}}},
+		"claude-test": {Status: StatusActive, Quota: QuotaState{ObservedAt: now, Signals: map[string]string{"reset_time": now.Add(time.Hour).Format(time.RFC3339)}}},
+	}
+	b.ModelStates = map[string]*ModelState{
+		"gemini-test": {Status: StatusActive, Quota: QuotaState{ObservedAt: now, Signals: map[string]string{"reset_time": now.Add(2 * time.Hour).Format(time.RFC3339)}}},
+		"claude-test": {Status: StatusActive, Quota: QuotaState{ObservedAt: now, Signals: map[string]string{"reset_time": now.Add(3 * time.Hour).Format(time.RFC3339)}}},
+	}
+	for _, tc := range []struct{ model, want string }{{"gemini-test", "b"}, {"claude-test", "a"}, {"unknown", "a"}} {
+		got, err := (&QuotaResetFirstSelector{}).Pick(context.Background(), "antigravity", tc.model, cliproxyexecutor.Options{}, []*Auth{b, a})
+		if err != nil || got.ID != tc.want {
+			t.Fatalf("Pick(%s) = %v, %v; want %s", tc.model, got, err, tc.want)
+		}
+	}
+	b.ModelStates["gemini-test"].Quota.ObservedAt = now.Add(-11 * time.Minute)
+	got, err := (&QuotaResetFirstSelector{}).Pick(context.Background(), "antigravity", "gemini-test", cliproxyexecutor.Options{}, []*Auth{a, b})
+	if err != nil || got.ID != "a" {
+		t.Fatalf("stale quota selected: %v, %v", got, err)
+	}
+}
+
+func TestQuotaResetFirstSelector_AntigravityManagerAlias(t *testing.T) {
+	for _, affinity := range []bool{false, true} {
+		for _, mixed := range []bool{false, true} {
+			t.Run(strconv.FormatBool(affinity)+"/mixed="+strconv.FormatBool(mixed), func(t *testing.T) {
+				var selector Selector = &QuotaResetFirstSelector{}
+				if affinity {
+					selector = NewSessionAffinitySelector(selector)
+					defer selector.(*SessionAffinitySelector).Stop()
+				}
+				manager := NewManager(nil, selector, nil)
+				manager.RegisterExecutor(&noForkAliasTestExecutor{id: "antigravity"})
+				manager.SetOAuthModelAlias(map[string][]internalconfig.OAuthModelAlias{"antigravity": {{Name: "gemini-test", Alias: "friendly", Fork: false}}})
+				now := time.Now()
+				for i, id := range []string{"quota-alias-a", "quota-alias-b"} {
+					a := &Auth{ID: id, Provider: "antigravity", Prefix: "team", Status: StatusActive, ModelStates: map[string]*ModelState{
+						"gemini-test": {Status: StatusActive, Quota: QuotaState{ObservedAt: now, Signals: map[string]string{"reset_time": now.Add(time.Duration(4-i*2) * time.Hour).Format(time.RFC3339)}}},
+					}}
+					if _, err := manager.Register(context.Background(), a); err != nil {
+						t.Fatal(err)
+					}
+					registry.GetGlobalRegistry().RegisterClient(id, "antigravity", []*registry.ModelInfo{{ID: "team/friendly"}})
+					t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(id) })
+				}
+				var got *Auth
+				var err error
+				if mixed {
+					got, _, _, err = manager.pickNextMixed(context.Background(), []string{"antigravity"}, "team/friendly(1024)", cliproxyexecutor.Options{}, map[string]struct{}{})
+				} else {
+					got, _, err = manager.pickNext(context.Background(), "antigravity", "team/friendly(1024)", cliproxyexecutor.Options{}, map[string]struct{}{})
+				}
+				if err != nil || got == nil || got.ID != "quota-alias-b" {
+					t.Fatalf("alias pick = %v, %v; want quota-alias-b", got, err)
+				}
+			})
+		}
+	}
+}
+
+func TestAntigravityQuotaObservationSurvivesRequest(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	now := time.Now()
+	a := &Auth{ID: "antigravity-observation", Provider: "antigravity", ModelStates: map[string]*ModelState{
+		"gemini-test": {Status: StatusActive, Quota: QuotaState{ObservedAt: now, Signals: map[string]string{"reset_time": now.Add(time.Hour).Format(time.RFC3339)}}},
+	}}
+	if _, err := manager.Register(context.Background(), a); err != nil {
+		t.Fatal(err)
+	}
+	manager.MarkResult(context.Background(), Result{AuthID: a.ID, Provider: "antigravity", Model: "gemini-test", Success: true})
+	got, _ := manager.GetByID(a.ID)
+	if got.ModelStates["gemini-test"].Quota.Signals["reset_time"] == "" {
+		t.Fatal("request erased active quota observation")
 	}
 }
