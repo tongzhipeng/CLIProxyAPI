@@ -226,3 +226,185 @@ func TestAntigravityQuotaObservationSurvivesRequest(t *testing.T) {
 		t.Fatal("request erased active quota observation")
 	}
 }
+
+func TestQuotaResetFirstSelector_AntigravityTieredMapping(t *testing.T) {
+	now := time.Now()
+	george := quotaResetTestAuth("george", nil, now)
+	kevin := quotaResetTestAuth("kevin", nil, now)
+	george.Provider = "antigravity"
+	kevin.Provider = "antigravity"
+	george.ModelStates = map[string]*ModelState{
+		"gemini-3.8-flash-tiered": {
+			Status: StatusActive,
+			Quota: QuotaState{
+				ObservedAt: now,
+				Signals: map[string]string{
+					"reset_time":         now.Add(3 * time.Hour).Format(time.RFC3339),
+					"remaining_fraction": "0.8",
+				},
+			},
+		},
+	}
+	kevin.ModelStates = map[string]*ModelState{
+		"gemini-3.8-flash-tiered": {
+			Status: StatusActive,
+			Quota: QuotaState{
+				ObservedAt: now,
+				Signals: map[string]string{
+					"reset_time":         now.Add(1 * time.Hour).Format(time.RFC3339),
+					"remaining_fraction": "0.8",
+				},
+			},
+		},
+	}
+
+	got, err := (&QuotaResetFirstSelector{}).Pick(context.Background(), "antigravity", "gemini-3.8-flash-high", cliproxyexecutor.Options{}, []*Auth{george, kevin})
+	if err != nil || got == nil || got.ID != "kevin" {
+		t.Fatalf("Pick(gemini-3.8-flash-high) = %v, %v; want kevin (soonest reset in tiered bucket)", got, err)
+	}
+}
+
+func TestQuotaResetFirstSelector_AntigravityExhaustedQuotaSkipped(t *testing.T) {
+	now := time.Now()
+	george := quotaResetTestAuth("george", nil, now)
+	kevin := quotaResetTestAuth("kevin", nil, now)
+	george.Provider = "antigravity"
+	kevin.Provider = "antigravity"
+	// George's reset is sooner (1h), but quota is exhausted (remaining_fraction = 0)
+	george.ModelStates = map[string]*ModelState{
+		"gemini-3.8-flash-tiered": {
+			Status: StatusActive,
+			Quota: QuotaState{
+				ObservedAt: now,
+				Signals: map[string]string{
+					"reset_time":         now.Add(1 * time.Hour).Format(time.RFC3339),
+					"remaining_fraction": "0",
+				},
+			},
+		},
+	}
+	// Kevin's reset is later (3h), but has quota remaining (remaining_fraction = 0.95)
+	kevin.ModelStates = map[string]*ModelState{
+		"gemini-3.8-flash-tiered": {
+			Status: StatusActive,
+			Quota: QuotaState{
+				ObservedAt: now,
+				Signals: map[string]string{
+					"reset_time":         now.Add(3 * time.Hour).Format(time.RFC3339),
+					"remaining_fraction": "0.95",
+				},
+			},
+		},
+	}
+
+	got, err := (&QuotaResetFirstSelector{}).Pick(context.Background(), "antigravity", "gemini-3.8-flash-high", cliproxyexecutor.Options{}, []*Auth{george, kevin})
+	if err != nil || got == nil || got.ID != "kevin" {
+		t.Fatalf("Pick(gemini-3.8-flash-high) = %v, %v; want kevin (george quota is exhausted)", got, err)
+	}
+}
+
+func TestQuotaResetFirstSelector_AntigravityCredentialWeeklyResetFallback(t *testing.T) {
+	now := time.Now()
+	george := quotaResetTestAuth("george", nil, now)
+	kevin := quotaResetTestAuth("kevin", nil, now)
+	george.Provider = "antigravity"
+	kevin.Provider = "antigravity"
+	// George's weekly reset is 3 days later, Kevin's weekly reset is in 12 hours
+	george.Quota.Signals = map[string]string{
+		"weekly_quota_reset_at": now.Add(3 * 24 * time.Hour).UTC().Format(time.RFC3339),
+	}
+	george.Quota.ObservedAt = now
+	kevin.Quota.Signals = map[string]string{
+		"weekly_quota_reset_at": now.Add(12 * time.Hour).UTC().Format(time.RFC3339),
+	}
+	kevin.Quota.ObservedAt = now
+
+	// When model has no specific model bucket reset, pick by credential-level weekly reset
+	got, err := (&QuotaResetFirstSelector{}).Pick(context.Background(), "antigravity", "some-unbucketed-model", cliproxyexecutor.Options{}, []*Auth{george, kevin})
+	if err != nil || got == nil || got.ID != "kevin" {
+		t.Fatalf("Pick(unbucketed) = %v, %v; want kevin (12h vs 3d weekly reset)", got, err)
+	}
+}
+
+func TestQuotaResetFirstSelector_AllExhaustedRecoversEarliest(t *testing.T) {
+	now := time.Now()
+	george := quotaResetTestAuth("george", nil, now)
+	kevin := quotaResetTestAuth("kevin", nil, now)
+	george.Provider = "antigravity"
+	kevin.Provider = "antigravity"
+	// Both are exhausted, but George resets in 1h and Kevin in 3h
+	george.ModelStates = map[string]*ModelState{
+		"gemini-3.8-flash-tiered": {
+			Status: StatusActive,
+			Quota: QuotaState{
+				ObservedAt: now,
+				Signals: map[string]string{
+					"reset_time":         now.Add(1 * time.Hour).Format(time.RFC3339),
+					"remaining_fraction": "0",
+				},
+			},
+		},
+	}
+	kevin.ModelStates = map[string]*ModelState{
+		"gemini-3.8-flash-tiered": {
+			Status: StatusActive,
+			Quota: QuotaState{
+				ObservedAt: now,
+				Signals: map[string]string{
+					"reset_time":         now.Add(3 * time.Hour).Format(time.RFC3339),
+					"remaining_fraction": "0",
+				},
+			},
+		},
+	}
+
+	got, err := (&QuotaResetFirstSelector{}).Pick(context.Background(), "antigravity", "gemini-3.8-flash-high", cliproxyexecutor.Options{}, []*Auth{george, kevin})
+	if err != nil || got == nil || got.ID != "george" {
+		t.Fatalf("Pick(all exhausted) = %v, %v; want george (earliest recovery)", got, err)
+	}
+}
+
+func TestQuotaResetFirstSelector_ActiveUnknownBeatsExhausted(t *testing.T) {
+	now := time.Now()
+	george := quotaResetTestAuth("george", nil, now)
+	kevin := quotaResetTestAuth("kevin", nil, now)
+	george.Provider = "antigravity"
+	kevin.Provider = "antigravity"
+	// George is exhausted with a 1h reset
+	george.ModelStates = map[string]*ModelState{
+		"gemini-3.8-flash-tiered": {
+			Status: StatusActive,
+			Quota: QuotaState{
+				ObservedAt: now,
+				Signals: map[string]string{
+					"reset_time":         now.Add(1 * time.Hour).Format(time.RFC3339),
+					"remaining_fraction": "0",
+				},
+			},
+		},
+	}
+	// Kevin has no quota signals (active unknown)
+	kevin.ModelStates = nil
+
+	got, err := (&QuotaResetFirstSelector{}).Pick(context.Background(), "antigravity", "gemini-3.8-flash-high", cliproxyexecutor.Options{}, []*Auth{george, kevin})
+	if err != nil || got == nil || got.ID != "kevin" {
+		t.Fatalf("Pick(unknown vs exhausted) = %v, %v; want kevin", got, err)
+	}
+}
+
+func TestQuotaResetFirstSelector_MetadataWeeklyReset(t *testing.T) {
+	now := time.Now()
+	george := quotaResetTestAuth("george", nil, now)
+	kevin := quotaResetTestAuth("kevin", nil, now)
+	george.Metadata = map[string]any{
+		"weekly_quota_reset_at": now.Add(3 * 24 * time.Hour).UTC().Format(time.RFC3339),
+	}
+	kevin.Metadata = map[string]any{
+		"weekly_quota_reset_at": now.Add(12 * time.Hour).UTC().Format(time.RFC3339),
+	}
+
+	got, err := (&QuotaResetFirstSelector{}).Pick(context.Background(), "antigravity", "gemini-3.8-flash-high", cliproxyexecutor.Options{}, []*Auth{george, kevin})
+	if err != nil || got == nil || got.ID != "kevin" {
+		t.Fatalf("Pick(metadata weekly) = %v, %v; want kevin", got, err)
+	}
+}

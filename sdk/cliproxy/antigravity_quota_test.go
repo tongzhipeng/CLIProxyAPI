@@ -104,6 +104,7 @@ func TestParseAntigravityQuotas(t *testing.T) {
 		{"invalid-time", `{"buckets":[{"modelId":"gemini-test","resetTime":"bad"}]}`, 0, false},
 		{"invalid-fraction", `{"buckets":[{"modelId":"gemini-test","remainingFraction":2,"resetTime":"2026-10-09T02:00:00Z"}]}`, 0, false},
 		{"expired", `{"buckets":[{"modelId":"gemini-test","remainingFraction":0,"resetTime":"2026-10-08T02:00:00Z"}]}`, 0, true},
+		{"tiered-expansion", `{"buckets":[{"modelId":"gemini-3.8-flash-tiered","remainingFraction":0.8,"resetTime":"2026-10-09T02:00:00Z"}]}`, 3, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			quotas, err := parseAntigravityQuotas([]byte(tc.body), now)

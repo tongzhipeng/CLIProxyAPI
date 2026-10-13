@@ -204,5 +204,15 @@ func parseAntigravityQuotas(body []byte, now time.Time) (map[string]coreauth.Quo
 		}
 		quotas[model] = coreauth.QuotaState{ObservedAt: now, Signals: signals}
 	}
+	for model, quota := range quotas {
+		if strings.HasSuffix(model, "-tiered") {
+			base := strings.TrimSuffix(model, "-tiered")
+			for _, alias := range []string{base + "-high", base} {
+				if _, exists := quotas[alias]; !exists {
+					quotas[alias] = quota
+				}
+			}
+		}
+	}
 	return quotas, nil
 }

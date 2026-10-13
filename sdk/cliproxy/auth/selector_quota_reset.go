@@ -24,15 +24,219 @@ func (s *QuotaResetFirstSelector) Pick(ctx context.Context, provider, model stri
 		return nil, err
 	}
 	available = preferCodexWebsocketAuths(ctx, provider, available)
-	picked := available[0]
-	var pickedReset time.Time
-	for _, candidate := range available {
-		reset, ok := quotaResetForModel(ctx, candidate, model, now)
-		if ok && (pickedReset.IsZero() || reset.Before(pickedReset)) {
-			picked, pickedReset = candidate, reset
+	best := evaluateCandidateQuota(ctx, available[0], model, 0, now)
+	for i := 1; i < len(available); i++ {
+		curr := evaluateCandidateQuota(ctx, available[i], model, i, now)
+		if isBetterCandidate(curr, best) {
+			best = curr
 		}
 	}
-	return picked, nil
+	return best.auth, nil
+}
+
+type candidateQuotaInfo struct {
+	auth  *Auth
+	tier  int // 1 = active with reset, 2 = active unknown, 3 = exhausted with reset, 4 = exhausted unknown
+	reset time.Time
+	index int
+}
+
+func isBetterCandidate(curr, best candidateQuotaInfo) bool {
+	if curr.tier != best.tier {
+		return curr.tier < best.tier
+	}
+	if (curr.tier == 1 || curr.tier == 3) && !curr.reset.Equal(best.reset) {
+		return curr.reset.Before(best.reset)
+	}
+	return curr.index < best.index
+}
+
+func evaluateCandidateQuota(ctx context.Context, a *Auth, model string, index int, now time.Time) candidateQuotaInfo {
+	info := candidateQuotaInfo{auth: a, index: index}
+	modelState := findModelStateForCandidate(ctx, a, model)
+
+	exhausted := false
+	if modelState != nil && isQuotaExhausted(modelState.Quota, now) {
+		exhausted = true
+	} else if isQuotaExhausted(a.Quota, now) {
+		exhausted = true
+	}
+
+	if weeklyReset, hasWeekly := candidateWeeklyResetAt(a, now); hasWeekly {
+		info.reset = weeklyReset
+		if exhausted {
+			info.tier = 3
+		} else {
+			info.tier = 1
+		}
+		return info
+	}
+
+	if modelState != nil {
+		q := modelState.Quota
+		if raw := q.Signals["reset_time"]; raw != "" {
+			if !q.ObservedAt.IsZero() && now.Sub(q.ObservedAt) <= 10*time.Minute {
+				if t, ok := firstQuotaSignalTime(q.Signals, "reset_time"); ok && t.After(now) {
+					info.reset = t
+					if exhausted {
+						info.tier = 3
+					} else {
+						info.tier = 1
+					}
+					return info
+				}
+			}
+		}
+	}
+
+	if reset, ok := quotaWindowResetAt(a.Quota, now); ok {
+		info.reset = reset
+		if exhausted {
+			info.tier = 3
+		} else {
+			info.tier = 1
+		}
+		return info
+	}
+
+	if reset, ok := quotaWindowResetFromAuth(a, now); ok {
+		info.reset = reset
+		if exhausted {
+			info.tier = 3
+		} else {
+			info.tier = 1
+		}
+		return info
+	}
+
+	if exhausted {
+		info.tier = 4
+	} else {
+		info.tier = 2
+	}
+	return info
+}
+
+func isQuotaExhausted(q QuotaState, now time.Time) bool {
+	if q.Exceeded && (q.NextRecoverAt.IsZero() || q.NextRecoverAt.After(now)) {
+		return true
+	}
+	if raw, ok := q.Signals["remaining_fraction"]; ok && strings.TrimSpace(raw) != "" {
+		if val, err := strconv.ParseFloat(strings.TrimSpace(raw), 64); err == nil && val <= 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func findModelStateForCandidate(ctx context.Context, a *Auth, model string) *ModelState {
+	if a == nil || len(a.ModelStates) == 0 {
+		return nil
+	}
+	model = canonicalModelKey(rewriteModelForAuth(model, a))
+	if ctx != nil {
+		if models, ok := ctx.Value(quotaResetModelsKey{}).(map[string]string); ok {
+			if m, ok := models[a.ID]; ok && m != "" {
+				model = m
+			}
+		}
+	}
+	if state := a.ModelStates[model]; state != nil {
+		return state
+	}
+	for _, candidate := range tieredModelCandidates(model) {
+		if state := a.ModelStates[candidate]; state != nil {
+			return state
+		}
+	}
+	return nil
+}
+
+func tieredModelCandidates(model string) []string {
+	model = strings.TrimSpace(strings.ToLower(model))
+	if model == "" {
+		return nil
+	}
+	var candidates []string
+	for _, suffix := range []string{"-high", "-medium", "-low", "-extra-low", "-thinking"} {
+		if strings.HasSuffix(model, suffix) {
+			base := model[:len(model)-len(suffix)]
+			candidates = append(candidates, base+"-tiered", base)
+			break
+		}
+	}
+	if strings.HasSuffix(model, "-tiered") {
+		base := strings.TrimSuffix(model, "-tiered")
+		candidates = append(candidates, base+"-high", base)
+	} else if len(candidates) == 0 {
+		candidates = append(candidates, model+"-tiered")
+	}
+	return candidates
+}
+
+func candidateWeeklyResetAt(a *Auth, now time.Time) (time.Time, bool) {
+	if a == nil {
+		return time.Time{}, false
+	}
+	if reset, ok := firstQuotaSignalTime(a.Quota.Signals, "Anthropic-Ratelimit-Unified-7d-Reset"); ok && reset.After(now) {
+		return reset, true
+	}
+	if reset, ok := codexWeeklyQuotaReset(a.Quota, now); ok {
+		return reset, true
+	}
+	if reset, ok := firstQuotaSignalTime(a.Quota.Signals, "weekly_quota_reset_at"); ok && reset.After(now) {
+		return reset, true
+	}
+	if a.Attributes != nil {
+		if raw := a.Attributes["weekly_quota_reset_at"]; raw != "" {
+			if t, err := time.Parse(time.RFC3339, raw); err == nil && t.After(now) {
+				return t, true
+			}
+		}
+	}
+	if a.Metadata != nil {
+		if raw, ok := a.Metadata["weekly_quota_reset_at"].(string); ok && raw != "" {
+			if t, err := time.Parse(time.RFC3339, raw); err == nil && t.After(now) {
+				return t, true
+			}
+		}
+	}
+	return time.Time{}, false
+}
+
+func codexWeeklyQuotaReset(q QuotaState, now time.Time) (time.Time, bool) {
+	reset, ok := codexQuotaWindowReset(q)
+	if !ok || !reset.After(now) {
+		return time.Time{}, false
+	}
+	minutes, _ := strconv.ParseInt(strings.TrimSpace(q.Signals["X-Codex-Secondary-Window-Minutes"]), 10, 64)
+	if minutes >= 1440 {
+		return reset, true
+	}
+	return time.Time{}, false
+}
+
+func quotaWindowResetFromAuth(a *Auth, now time.Time) (time.Time, bool) {
+	if a == nil {
+		return time.Time{}, false
+	}
+	for _, key := range []string{"reset_time", "daily_quota_reset_at"} {
+		if a.Attributes != nil {
+			if raw := a.Attributes[key]; raw != "" {
+				if t, err := time.Parse(time.RFC3339, raw); err == nil && t.After(now) {
+					return t, true
+				}
+			}
+		}
+		if a.Metadata != nil {
+			if raw, ok := a.Metadata[key].(string); ok && raw != "" {
+				if t, err := time.Parse(time.RFC3339, raw); err == nil && t.After(now) {
+					return t, true
+				}
+			}
+		}
+	}
+	return time.Time{}, false
 }
 
 // quotaResetModelsKey carries the manager's credential-aware alias resolution.

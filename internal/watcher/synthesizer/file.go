@@ -232,6 +232,22 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) ([
 	coreauth.SetOAuthModelAliasesAttribute(a, perAccountModelAliases)
 	ApplyAuthExcludedModelsMeta(a, cfg, perAccountExcluded, "oauth")
 	applyFingerprintProfileAttribute(a, metadata)
+	for _, key := range []string{"weekly_quota_reset_at", "weekly-quota-reset-at", "weekly_reset_time", "reset_time", "reset-time"} {
+		if rawReset, ok := metadata[key]; ok {
+			if s, isStr := rawReset.(string); isStr && strings.TrimSpace(s) != "" {
+				if a.Quota.Signals == nil {
+					a.Quota.Signals = make(map[string]string)
+				}
+				targetKey := "weekly_quota_reset_at"
+				if strings.Contains(key, "reset_time") || strings.Contains(key, "reset-time") {
+					targetKey = "reset_time"
+				}
+				a.Quota.Signals[targetKey] = strings.TrimSpace(s)
+				a.Attributes[targetKey] = strings.TrimSpace(s)
+				break
+			}
+		}
+	}
 	// For codex auth files, extract plan_type from metadata or JWT id_token.
 	if provider == "codex" {
 		if ptRaw, ok := metadata["plan_type"].(string); ok && strings.TrimSpace(ptRaw) != "" {
