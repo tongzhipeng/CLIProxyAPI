@@ -302,6 +302,7 @@ func (b *Builder) Build() (*Service, error) {
 			service.reloadConfigFromWatcher()
 		}),
 	)
+	service.wireRoutingSelector()
 	return service, nil
 }
 

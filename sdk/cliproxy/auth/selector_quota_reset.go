@@ -13,7 +13,11 @@ import (
 // quota window resets soonest, so quota that would expire unused is consumed first.
 // Antigravity uses the requested model bucket from active quota probes.
 // Credentials without a future reset observation keep fill-first order after them.
-type QuotaResetFirstSelector struct{}
+type QuotaResetFirstSelector struct {
+	// OnRefreshableAuth, when non-nil, is invoked during request candidate evaluation
+	// when a candidate account is discovered to have entered the refreshable state (now >= reset).
+	OnRefreshableAuth func(auth *Auth, now time.Time)
+}
 
 // Pick selects the available auth with the earliest upcoming quota window reset.
 func (s *QuotaResetFirstSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
@@ -25,8 +29,14 @@ func (s *QuotaResetFirstSelector) Pick(ctx context.Context, provider, model stri
 	}
 	available = preferCodexWebsocketAuths(ctx, provider, available)
 	best := evaluateCandidateQuota(ctx, available[0], model, 0, now)
+	if (best.tier == 3 || best.tier == 6) && s != nil && s.OnRefreshableAuth != nil {
+		s.OnRefreshableAuth(best.auth, now)
+	}
 	for i := 1; i < len(available); i++ {
 		curr := evaluateCandidateQuota(ctx, available[i], model, i, now)
+		if (curr.tier == 3 || curr.tier == 6) && s != nil && s.OnRefreshableAuth != nil {
+			s.OnRefreshableAuth(curr.auth, now)
+		}
 		if isBetterCandidate(curr, best) {
 			best = curr
 		}
@@ -286,6 +296,29 @@ func candidateWindowResetInfo(a *Auth, now time.Time) (candidateResetInfo, bool)
 		return candidateResetInfo{reset: rawTime, hasReset: true, refreshable: false}, true
 	}
 	return candidateResetInfo{reset: rawTime, hasReset: true, refreshable: true}, true
+}
+
+// IsAuthRefreshable reports whether an auth has an observed quota or window reset time
+// that has arrived or passed (now >= reset).
+func IsAuthRefreshable(a *Auth, now time.Time) bool {
+	if a == nil {
+		return false
+	}
+	if weekly, ok := candidateWeeklyResetInfo(a, now); ok && weekly.refreshable {
+		return true
+	}
+	if win, ok := candidateWindowResetInfo(a, now); ok && win.refreshable {
+		return true
+	}
+	for _, state := range a.ModelStates {
+		if state == nil {
+			continue
+		}
+		if t, ok := firstQuotaSignalTime(state.Quota.Signals, "reset_time"); ok && !t.After(now) {
+			return true
+		}
+	}
+	return false
 }
 
 func candidateWeeklyResetAt(a *Auth, now time.Time) (time.Time, bool) {

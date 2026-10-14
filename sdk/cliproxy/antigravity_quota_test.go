@@ -171,7 +171,50 @@ func TestAntigravityQuotaRefreshAccountIsolation(t *testing.T) {
 	}
 }
 
-func TestAntigravityQuotaRefresh_RefreshableAccountRestoresQuotaWithJitter(t *testing.T) {
+func TestAntigravityQuotaRefresh_PeriodicTimerSkipsRefreshableAccount(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	var probeCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		probeCalls.Add(1)
+		fmt.Fprintf(w, `{"buckets":[{"modelId":"gemini-test","remainingFraction":1.0,"resetTime":%q}]}`, now.Add(time.Hour).Format(time.RFC3339))
+	}))
+	defer server.Close()
+
+	m := coreauth.NewManager(nil, nil, nil)
+	rowan := &coreauth.Auth{
+		ID:         "rowan",
+		Provider:   "antigravity",
+		Status:     coreauth.StatusActive,
+		Attributes: map[string]string{"base_url": server.URL},
+		Metadata: map[string]any{
+			"access_token":          "rowan-token",
+			"weekly_quota_reset_at": now.Add(-5 * time.Minute).Format(time.RFC3339),
+		},
+	}
+	if _, err := m.Register(context.Background(), rowan); err != nil {
+		t.Fatal(err)
+	}
+
+	s := &Service{coreManager: m, cfg: &config.Config{Routing: internalconfig.RoutingConfig{Strategy: "quota-reset-first"}}}
+	// Entry exists for rowan with matching RegistrationEpoch, but rowan's reset time has passed (refreshable).
+	tokenHash := [32]byte{}
+	next := map[string]antigravityQuotaRefreshEntry{
+		"rowan": {
+			next:      now.Add(-time.Second),
+			epoch:     rowan.RegistrationEpoch,
+			tokenHash: tokenHash,
+		},
+	}
+
+	// Periodic timer tick runs: it MUST NOT probe rowan on a timer because rowan is refreshable
+	s.refreshAntigravityQuotas(context.Background(), next, now)
+
+	if probeCalls.Load() != 0 {
+		t.Fatalf("expected 0 probe calls from periodic timer for refreshable account, got %d", probeCalls.Load())
+	}
+}
+
+func TestAntigravityQuotaRefresh_RequestTriggeredProbeWithJitter(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	newReset := now.Add(7 * 24 * time.Hour) // New cycle reset in 7 days
 	var probeCalls atomic.Int32
@@ -181,10 +224,10 @@ func TestAntigravityQuotaRefresh_RefreshableAccountRestoresQuotaWithJitter(t *te
 	}))
 	defer server.Close()
 
-	// Injected deterministic 90s jitter for testing
+	// Injected short deterministic 30ms jitter for testing
 	origJitter := antigravityQuotaJitterFunc
 	antigravityQuotaJitterFunc = func(id string, base time.Time) time.Duration {
-		return 90 * time.Second
+		return 30 * time.Millisecond
 	}
 	defer func() { antigravityQuotaJitterFunc = origJitter }()
 
@@ -204,13 +247,24 @@ func TestAntigravityQuotaRefresh_RefreshableAccountRestoresQuotaWithJitter(t *te
 	}
 
 	s := &Service{coreManager: m, cfg: &config.Config{Routing: internalconfig.RoutingConfig{Strategy: "quota-reset-first"}}}
-	next := make(map[string]antigravityQuotaRefreshEntry)
 
-	// First pass: trigger probe to refresh rowan's newly started cycle
-	s.refreshAntigravityQuotas(context.Background(), next, now)
+	// Request arrives and discovers rowan is in refreshable time -> triggers delayed refresh
+	s.handleRefreshableAuth(rowan, now)
+
+	// Immediately, probe must NOT have fired yet (must wait for jitter delay)
+	if probeCalls.Load() != 0 {
+		t.Fatalf("expected 0 probe calls immediately, got %d", probeCalls.Load())
+	}
+
+	// Multiple requests during jitter delay do not trigger duplicate probes
+	s.handleRefreshableAuth(rowan, now.Add(10*time.Millisecond))
+	s.handleRefreshableAuth(rowan, now.Add(20*time.Millisecond))
+
+	// Wait for the scheduled probe to execute
+	s.antigravityProbeWg.Wait()
 
 	if probeCalls.Load() != 1 {
-		t.Fatalf("expected 1 probe call, got %d", probeCalls.Load())
+		t.Fatalf("expected exactly 1 probe call, got %d", probeCalls.Load())
 	}
 
 	got, _ := m.GetByID("rowan")
@@ -224,11 +278,5 @@ func TestAntigravityQuotaRefresh_RefreshableAccountRestoresQuotaWithJitter(t *te
 	}
 	if state.Quota.Signals["reset_time"] != newReset.Format(time.RFC3339Nano) {
 		t.Fatalf("expected reset_time %s, got %s", newReset.Format(time.RFC3339Nano), state.Quota.Signals["reset_time"])
-	}
-
-	// Verify next refresh entry is scheduled with interval
-	entry := next["rowan"]
-	if !entry.next.Equal(now.Add(antigravityQuotaRefreshInterval)) {
-		t.Fatalf("expected next refresh at %v, got %v", now.Add(antigravityQuotaRefreshInterval), entry.next)
 	}
 }

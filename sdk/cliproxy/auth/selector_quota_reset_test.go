@@ -512,3 +512,41 @@ func TestQuotaResetFirstSelector_AllRefreshableStillSelects(t *testing.T) {
 		t.Fatalf("Pick(all refreshable) returned nil/error: %v, %v", got, err)
 	}
 }
+
+func TestQuotaResetFirstSelector_NotifiesRefreshableAuthOnRequest(t *testing.T) {
+	now := time.Now()
+	rowan := quotaResetTestAuth("rowan", nil, now)
+	kevin := quotaResetTestAuth("kevin", nil, now)
+	rowan.Provider = "antigravity"
+	kevin.Provider = "antigravity"
+	// rowan's weekly reset passed 5m ago (refreshable)
+	rowan.Metadata = map[string]any{"weekly_quota_reset_at": now.Add(-5 * time.Minute).UTC().Format(time.RFC3339)}
+	// kevin resets in 2h (unexpired future reset)
+	kevin.Metadata = map[string]any{"weekly_quota_reset_at": now.Add(2 * time.Hour).UTC().Format(time.RFC3339)}
+
+	var notifiedID string
+	selector := &QuotaResetFirstSelector{
+		OnRefreshableAuth: func(auth *Auth, observedNow time.Time) {
+			notifiedID = auth.ID
+		},
+	}
+
+	got, err := selector.Pick(context.Background(), "antigravity", "gemini-3.8-flash-high", cliproxyexecutor.Options{}, []*Auth{rowan, kevin})
+	if err != nil || got == nil || got.ID != "kevin" {
+		t.Fatalf("Pick = %v, %v; want kevin", got, err)
+	}
+	if notifiedID != "rowan" {
+		t.Fatalf("expected OnRefreshableAuth notified for rowan, got %q", notifiedID)
+	}
+
+	// Negative case: when both have future resets, OnRefreshableAuth must not be called
+	notifiedID = ""
+	rowan.Metadata = map[string]any{"weekly_quota_reset_at": now.Add(5 * time.Hour).UTC().Format(time.RFC3339)}
+	_, err = selector.Pick(context.Background(), "antigravity", "gemini-3.8-flash-high", cliproxyexecutor.Options{}, []*Auth{rowan, kevin})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if notifiedID != "" {
+		t.Fatalf("expected no notification for unexpired auths, got %q", notifiedID)
+	}
+}

@@ -64,7 +64,7 @@ func normalizedRoutingRuntimeState(cfg *config.Config) routingRuntimeState {
 	return state
 }
 
-func newRoutingSelector(state routingRuntimeState) coreauth.Selector {
+func newRoutingSelector(state routingRuntimeState, onRefreshable ...func(a *coreauth.Auth, now time.Time)) coreauth.Selector {
 	var selector coreauth.Selector
 	switch state.strategy {
 	case "weighted-round-robin":
@@ -72,7 +72,11 @@ func newRoutingSelector(state routingRuntimeState) coreauth.Selector {
 	case "fill-first":
 		selector = &coreauth.FillFirstSelector{}
 	case "quota-reset-first":
-		selector = &coreauth.QuotaResetFirstSelector{}
+		qrf := &coreauth.QuotaResetFirstSelector{}
+		if len(onRefreshable) > 0 && onRefreshable[0] != nil {
+			qrf.OnRefreshableAuth = onRefreshable[0]
+		}
+		selector = qrf
 	default:
 		selector = &coreauth.RoundRobinSelector{}
 	}
@@ -85,6 +89,26 @@ func newRoutingSelector(state routingRuntimeState) coreauth.Selector {
 		})
 	}
 	return selector
+}
+
+func wireRefreshableHandler(selector coreauth.Selector, handler func(a *coreauth.Auth, now time.Time)) {
+	if selector == nil || handler == nil {
+		return
+	}
+	if qrf, ok := selector.(*coreauth.QuotaResetFirstSelector); ok {
+		qrf.OnRefreshableAuth = handler
+		return
+	}
+	if affinity, ok := selector.(*coreauth.SessionAffinitySelector); ok {
+		wireRefreshableHandler(affinity.Fallback(), handler)
+	}
+}
+
+func (s *Service) wireRoutingSelector() {
+	if s == nil || s.coreManager == nil {
+		return
+	}
+	wireRefreshableHandler(s.coreManager.Selector(), s.handleRefreshableAuth)
 }
 
 func (s *Service) applyConfigUpdateWithAuthSynthesis(ctx context.Context, newCfg *config.Config, synthesizeConfigAuths bool) bool {
@@ -219,7 +243,7 @@ func (s *Service) applyManagerConfig(ctx context.Context, commit configCommit) b
 	}
 	routingState := normalizedRoutingRuntimeState(commit.cfg)
 	if s.appliedRoutingState == nil || *s.appliedRoutingState != routingState {
-		s.coreManager.SetSelector(newRoutingSelector(routingState))
+		s.coreManager.SetSelector(newRoutingSelector(routingState, s.handleRefreshableAuth))
 		s.appliedRoutingState = &routingState
 	}
 	s.applyRetryConfig(commit.cfg)

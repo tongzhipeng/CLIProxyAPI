@@ -25,7 +25,7 @@ const antigravityQuotaRefreshInterval = 5 * time.Minute
 var antigravityQuotaJitterFunc = defaultAntigravityQuotaJitter
 
 func defaultAntigravityQuotaJitter(id string, base time.Time) time.Duration {
-	h := sha256.Sum256([]byte(fmt.Sprintf("%s:%d", id, base.Unix())))
+	h := sha256.Sum256([]byte(fmt.Sprintf("%s:%d", id, base.UnixNano())))
 	secs := 60 + int(h[0])%120 // 60s ~ 179s (1 to 3 minutes)
 	return time.Duration(secs) * time.Second
 }
@@ -93,6 +93,11 @@ func (s *Service) refreshAntigravityQuotas(ctx context.Context, next map[string]
 		if entry.epoch == a.RegistrationEpoch && entry.tokenHash == tokenHash && now.Before(entry.next) {
 			continue
 		}
+		// Refreshable accounts must not be probed proactively on a periodic timer tick.
+		// They are only probed when an incoming user request discovers the refreshable state.
+		if entry.epoch == a.RegistrationEpoch && coreauth.IsAuthRefreshable(a, now) {
+			continue
+		}
 
 		workers.Go(func() error {
 			if ctx.Err() != nil {
@@ -102,20 +107,6 @@ func (s *Service) refreshAntigravityQuotas(ctx context.Context, next map[string]
 			entry := antigravityQuotaRefreshEntry{next: now.Add(time.Minute), epoch: a.RegistrationEpoch, tokenHash: tokenHash}
 			if err == nil && ctx.Err() == nil && s.coreManager.ObserveAntigravityQuotas(a, quotas, now) {
 				entry.next = now.Add(antigravityQuotaRefreshInterval)
-				for _, quota := range quotas {
-					if reset, errParse := time.Parse(time.RFC3339, quota.Signals["reset_time"]); errParse == nil && reset.After(now) {
-						target := reset.Add(antigravityQuotaJitterFunc(a.ID, reset))
-						if target.Before(entry.next) {
-							entry.next = target
-						}
-					}
-				}
-				if weekly, ok := firstWeeklyResetTimeForAuth(a); ok && weekly.After(now) {
-					target := weekly.Add(antigravityQuotaJitterFunc(a.ID, weekly))
-					if target.Before(entry.next) {
-						entry.next = target
-					}
-				}
 			} else if err != nil && ctx.Err() == nil {
 				// Errors contain status/parse details only, never the upstream body or credentials.
 				log.WithField("auth_id", a.ID).Debugf("antigravity quota probe failed: %v", err)
@@ -260,4 +251,79 @@ func firstWeeklyResetTimeForAuth(a *coreauth.Auth) (time.Time, bool) {
 		}
 	}
 	return time.Time{}, false
+}
+
+func (s *Service) handleRefreshableAuth(a *coreauth.Auth, now time.Time) {
+	if s == nil || s.coreManager == nil || a == nil {
+		return
+	}
+	if !strings.EqualFold(a.Provider, "antigravity") {
+		return
+	}
+	s.cfgMu.RLock()
+	cfg := s.cfg
+	enabled := cfg != nil && !cfg.Home.Enabled && normalizedRoutingRuntimeState(cfg).strategy == "quota-reset-first"
+	s.cfgMu.RUnlock()
+	if !enabled {
+		return
+	}
+
+	s.antigravityScheduledMu.Lock()
+	if s.antigravityScheduled == nil {
+		s.antigravityScheduled = make(map[string]time.Time)
+	}
+	targetTime, exists := s.antigravityScheduled[a.ID]
+	if exists && now.Before(targetTime) {
+		s.antigravityScheduledMu.Unlock()
+		return
+	}
+	if exists && now.Sub(targetTime) < time.Minute {
+		s.antigravityScheduledMu.Unlock()
+		return
+	}
+
+	delay := antigravityQuotaJitterFunc(a.ID, now)
+	targetTime = now.Add(delay)
+	s.antigravityScheduled[a.ID] = targetTime
+	s.antigravityScheduledMu.Unlock()
+
+	s.antigravityProbeWg.Add(1)
+	time.AfterFunc(delay, func() {
+		defer s.antigravityProbeWg.Done()
+		s.executeScheduledAntigravityProbe(a.ID)
+	})
+}
+
+func (s *Service) executeScheduledAntigravityProbe(authID string) {
+	if s == nil || s.coreManager == nil {
+		return
+	}
+	s.cfgMu.RLock()
+	cfg := s.cfg
+	enabled := cfg != nil && !cfg.Home.Enabled && normalizedRoutingRuntimeState(cfg).strategy == "quota-reset-first"
+	s.cfgMu.RUnlock()
+	if !enabled {
+		return
+	}
+
+	a, ok := s.coreManager.GetByID(authID)
+	if !ok || a == nil || a.Disabled || a.Status == coreauth.StatusDisabled {
+		return
+	}
+	token, _ := a.Metadata["access_token"].(string)
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return
+	}
+
+	now := time.Now()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	quotas, err := s.fetchAntigravityQuotas(ctx, cfg, a, token, now)
+	if err == nil {
+		s.coreManager.ObserveAntigravityQuotas(a, quotas, now)
+	} else {
+		log.WithField("auth_id", authID).Debugf("antigravity request-triggered quota probe failed: %v", err)
+	}
 }

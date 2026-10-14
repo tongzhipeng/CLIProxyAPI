@@ -951,6 +951,14 @@ func NewSessionAffinitySelectorWithConfig(cfg SessionAffinityConfig) *SessionAff
 	}
 }
 
+// Fallback returns the underlying fallback selector.
+func (s *SessionAffinitySelector) Fallback() Selector {
+	if s == nil {
+		return nil
+	}
+	return s.fallback
+}
+
 // Trees returns a backward-compatible in-memory session tree store.
 // Deprecated: Session tree management has moved to Home.
 func (s *SessionAffinitySelector) Trees() *cliproxysession.InMemorySessionTreeStore {

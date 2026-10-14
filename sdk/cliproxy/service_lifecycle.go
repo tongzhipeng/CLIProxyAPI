@@ -72,6 +72,7 @@ func (s *Service) Run(ctx context.Context) error {
 
 	s.applyRetryConfig(s.cfg)
 	s.configureCooldownStateStore(s.cfg)
+	s.wireRoutingSelector()
 
 	s.registerPluginAuthParser()
 	if s.coreManager != nil && !homeEnabled {
