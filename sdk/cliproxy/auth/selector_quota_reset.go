@@ -36,7 +36,7 @@ func (s *QuotaResetFirstSelector) Pick(ctx context.Context, provider, model stri
 
 type candidateQuotaInfo struct {
 	auth  *Auth
-	tier  int // 1 = active with reset, 2 = active unknown, 3 = exhausted with reset, 4 = exhausted unknown
+	tier  int // 1 = active with future reset, 2 = active unknown, 3 = active refreshable, 4 = exhausted with future reset, 5 = exhausted unknown, 6 = exhausted refreshable
 	reset time.Time
 	index int
 }
@@ -45,10 +45,19 @@ func isBetterCandidate(curr, best candidateQuotaInfo) bool {
 	if curr.tier != best.tier {
 		return curr.tier < best.tier
 	}
-	if (curr.tier == 1 || curr.tier == 3) && !curr.reset.Equal(best.reset) {
+	if (curr.tier == 1 || curr.tier == 4) && !curr.reset.Equal(best.reset) {
+		return curr.reset.Before(best.reset)
+	}
+	if (curr.tier == 3 || curr.tier == 6) && !curr.reset.Equal(best.reset) {
 		return curr.reset.Before(best.reset)
 	}
 	return curr.index < best.index
+}
+
+type candidateResetInfo struct {
+	reset       time.Time
+	hasReset    bool
+	refreshable bool
 }
 
 func evaluateCandidateQuota(ctx context.Context, a *Auth, model string, index int, now time.Time) candidateQuotaInfo {
@@ -62,57 +71,60 @@ func evaluateCandidateQuota(ctx context.Context, a *Auth, model string, index in
 		exhausted = true
 	}
 
-	if weeklyReset, hasWeekly := candidateWeeklyResetAt(a, now); hasWeekly {
-		info.reset = weeklyReset
-		if exhausted {
-			info.tier = 3
-		} else {
-			info.tier = 1
-		}
-		return info
+	var (
+		bestReset   candidateResetInfo
+		hasAnyReset bool
+	)
+
+	if weekly, ok := candidateWeeklyResetInfo(a, now); ok {
+		bestReset = weekly
+		hasAnyReset = true
 	}
 
-	if modelState != nil {
-		q := modelState.Quota
-		if raw := q.Signals["reset_time"]; raw != "" {
-			if !q.ObservedAt.IsZero() && now.Sub(q.ObservedAt) <= 10*time.Minute {
-				if t, ok := firstQuotaSignalTime(q.Signals, "reset_time"); ok && t.After(now) {
-					info.reset = t
-					if exhausted {
-						info.tier = 3
-					} else {
-						info.tier = 1
-					}
-					return info
-				}
+	if modelReset, ok := candidateModelResetInfo(ctx, a, model, now); ok {
+		if !hasAnyReset {
+			bestReset = modelReset
+			hasAnyReset = true
+		} else if !bestReset.refreshable && !modelReset.refreshable {
+			// Both are in the future: choose the sooner upcoming reset.
+			if modelReset.reset.Before(bestReset.reset) {
+				bestReset = modelReset
 			}
+		} else if bestReset.refreshable && !modelReset.refreshable {
+			// Model bucket has a future observation that overrides past weekly window.
+			bestReset = modelReset
 		}
 	}
 
-	if reset, ok := quotaWindowResetAt(a.Quota, now); ok {
-		info.reset = reset
+	if !hasAnyReset {
+		if winReset, ok := candidateWindowResetInfo(a, now); ok {
+			bestReset = winReset
+			hasAnyReset = true
+		}
+	}
+
+	if !hasAnyReset {
 		if exhausted {
-			info.tier = 3
+			info.tier = 5
 		} else {
-			info.tier = 1
+			info.tier = 2
 		}
 		return info
 	}
 
-	if reset, ok := quotaWindowResetFromAuth(a, now); ok {
-		info.reset = reset
-		if exhausted {
-			info.tier = 3
-		} else {
-			info.tier = 1
-		}
-		return info
-	}
-
+	info.reset = bestReset.reset
 	if exhausted {
-		info.tier = 4
+		if bestReset.refreshable {
+			info.tier = 6
+		} else {
+			info.tier = 4
+		}
 	} else {
-		info.tier = 2
+		if bestReset.refreshable {
+			info.tier = 3
+		} else {
+			info.tier = 1
+		}
 	}
 	return info
 }
@@ -174,39 +186,119 @@ func tieredModelCandidates(model string) []string {
 	return candidates
 }
 
-func candidateWeeklyResetAt(a *Auth, now time.Time) (time.Time, bool) {
+func candidateWeeklyResetInfo(a *Auth, now time.Time) (candidateResetInfo, bool) {
 	if a == nil {
-		return time.Time{}, false
+		return candidateResetInfo{}, false
 	}
-	if reset, ok := firstQuotaSignalTime(a.Quota.Signals, "Anthropic-Ratelimit-Unified-7d-Reset"); ok && reset.After(now) {
-		return reset, true
-	}
-	if reset, ok := codexWeeklyQuotaReset(a.Quota, now); ok {
-		return reset, true
-	}
-	if reset, ok := firstQuotaSignalTime(a.Quota.Signals, "weekly_quota_reset_at"); ok && reset.After(now) {
-		return reset, true
-	}
-	if a.Attributes != nil {
-		if raw := a.Attributes["weekly_quota_reset_at"]; raw != "" {
-			if t, err := time.Parse(time.RFC3339, raw); err == nil && t.After(now) {
-				return t, true
-			}
+	var (
+		rawTime time.Time
+		found   bool
+	)
+	if reset, ok := firstQuotaSignalTime(a.Quota.Signals, "Anthropic-Ratelimit-Unified-7d-Reset"); ok {
+		rawTime, found = reset, true
+	} else if reset, ok := codexWeeklyQuotaResetRaw(a.Quota); ok {
+		rawTime, found = reset, true
+	} else if reset, ok := firstQuotaSignalTime(a.Quota.Signals, "weekly_quota_reset_at"); ok {
+		rawTime, found = reset, true
+	} else if a.Attributes != nil && a.Attributes["weekly_quota_reset_at"] != "" {
+		if t, err := time.Parse(time.RFC3339, a.Attributes["weekly_quota_reset_at"]); err == nil {
+			rawTime, found = t, true
 		}
-	}
-	if a.Metadata != nil {
+	} else if a.Metadata != nil {
 		if raw, ok := a.Metadata["weekly_quota_reset_at"].(string); ok && raw != "" {
-			if t, err := time.Parse(time.RFC3339, raw); err == nil && t.After(now) {
-				return t, true
+			if t, err := time.Parse(time.RFC3339, raw); err == nil {
+				rawTime, found = t, true
 			}
 		}
+	}
+	if !found {
+		return candidateResetInfo{}, false
+	}
+	if rawTime.After(now) {
+		return candidateResetInfo{reset: rawTime, hasReset: true, refreshable: false}, true
+	}
+	return candidateResetInfo{reset: rawTime, hasReset: true, refreshable: true}, true
+}
+
+func candidateModelResetInfo(ctx context.Context, a *Auth, model string, now time.Time) (candidateResetInfo, bool) {
+	modelState := findModelStateForCandidate(ctx, a, model)
+	if modelState == nil {
+		return candidateResetInfo{}, false
+	}
+	q := modelState.Quota
+	raw := q.Signals["reset_time"]
+	if raw == "" {
+		return candidateResetInfo{}, false
+	}
+	if !q.ObservedAt.IsZero() && now.Sub(q.ObservedAt) > 10*time.Minute {
+		return candidateResetInfo{}, false
+	}
+	t, ok := firstQuotaSignalTime(q.Signals, "reset_time")
+	if !ok {
+		return candidateResetInfo{}, false
+	}
+	if t.After(now) {
+		return candidateResetInfo{reset: t, hasReset: true, refreshable: false}, true
+	}
+	return candidateResetInfo{reset: t, hasReset: true, refreshable: true}, true
+}
+
+func candidateWindowResetInfo(a *Auth, now time.Time) (candidateResetInfo, bool) {
+	if a == nil {
+		return candidateResetInfo{}, false
+	}
+	var (
+		rawTime time.Time
+		found   bool
+	)
+	if reset, ok := firstQuotaSignalTime(a.Quota.Signals,
+		"Anthropic-Ratelimit-Unified-7d-Reset",
+		"Anthropic-Ratelimit-Unified-5h-Reset",
+		"Anthropic-Ratelimit-Unified-Reset",
+	); ok {
+		rawTime, found = reset, true
+	} else if reset, ok := codexQuotaWindowReset(a.Quota); ok {
+		rawTime, found = reset, true
+	} else if reset, ok := firstQuotaSignalTime(a.Quota.Signals, "weekly_quota_reset_at", "daily_quota_reset_at"); ok {
+		rawTime, found = reset, true
+	} else {
+		for _, key := range []string{"reset_time", "daily_quota_reset_at"} {
+			if a.Attributes != nil && a.Attributes[key] != "" {
+				if t, err := time.Parse(time.RFC3339, a.Attributes[key]); err == nil {
+					rawTime, found = t, true
+					break
+				}
+			}
+			if a.Metadata != nil {
+				if raw, ok := a.Metadata[key].(string); ok && raw != "" {
+					if t, err := time.Parse(time.RFC3339, raw); err == nil {
+						rawTime, found = t, true
+						break
+					}
+				}
+			}
+		}
+	}
+	if !found {
+		return candidateResetInfo{}, false
+	}
+	if rawTime.After(now) {
+		return candidateResetInfo{reset: rawTime, hasReset: true, refreshable: false}, true
+	}
+	return candidateResetInfo{reset: rawTime, hasReset: true, refreshable: true}, true
+}
+
+func candidateWeeklyResetAt(a *Auth, now time.Time) (time.Time, bool) {
+	info, ok := candidateWeeklyResetInfo(a, now)
+	if ok && !info.refreshable {
+		return info.reset, true
 	}
 	return time.Time{}, false
 }
 
-func codexWeeklyQuotaReset(q QuotaState, now time.Time) (time.Time, bool) {
+func codexWeeklyQuotaResetRaw(q QuotaState) (time.Time, bool) {
 	reset, ok := codexQuotaWindowReset(q)
-	if !ok || !reset.After(now) {
+	if !ok {
 		return time.Time{}, false
 	}
 	minutes, _ := strconv.ParseInt(strings.TrimSpace(q.Signals["X-Codex-Secondary-Window-Minutes"]), 10, 64)
@@ -216,25 +308,18 @@ func codexWeeklyQuotaReset(q QuotaState, now time.Time) (time.Time, bool) {
 	return time.Time{}, false
 }
 
-func quotaWindowResetFromAuth(a *Auth, now time.Time) (time.Time, bool) {
-	if a == nil {
+func codexWeeklyQuotaReset(q QuotaState, now time.Time) (time.Time, bool) {
+	reset, ok := codexWeeklyQuotaResetRaw(q)
+	if !ok || !reset.After(now) {
 		return time.Time{}, false
 	}
-	for _, key := range []string{"reset_time", "daily_quota_reset_at"} {
-		if a.Attributes != nil {
-			if raw := a.Attributes[key]; raw != "" {
-				if t, err := time.Parse(time.RFC3339, raw); err == nil && t.After(now) {
-					return t, true
-				}
-			}
-		}
-		if a.Metadata != nil {
-			if raw, ok := a.Metadata[key].(string); ok && raw != "" {
-				if t, err := time.Parse(time.RFC3339, raw); err == nil && t.After(now) {
-					return t, true
-				}
-			}
-		}
+	return reset, true
+}
+
+func quotaWindowResetFromAuth(a *Auth, now time.Time) (time.Time, bool) {
+	info, ok := candidateWindowResetInfo(a, now)
+	if ok && !info.refreshable {
+		return info.reset, true
 	}
 	return time.Time{}, false
 }

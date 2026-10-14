@@ -22,6 +22,14 @@ import (
 
 const antigravityQuotaRefreshInterval = 5 * time.Minute
 
+var antigravityQuotaJitterFunc = defaultAntigravityQuotaJitter
+
+func defaultAntigravityQuotaJitter(id string, base time.Time) time.Duration {
+	h := sha256.Sum256([]byte(fmt.Sprintf("%s:%d", id, base.Unix())))
+	secs := 60 + int(h[0])%120 // 60s ~ 179s (1 to 3 minutes)
+	return time.Duration(secs) * time.Second
+}
+
 type antigravityQuotaRefreshEntry struct {
 	next      time.Time
 	epoch     uint64
@@ -95,8 +103,17 @@ func (s *Service) refreshAntigravityQuotas(ctx context.Context, next map[string]
 			if err == nil && ctx.Err() == nil && s.coreManager.ObserveAntigravityQuotas(a, quotas, now) {
 				entry.next = now.Add(antigravityQuotaRefreshInterval)
 				for _, quota := range quotas {
-					if reset, errParse := time.Parse(time.RFC3339, quota.Signals["reset_time"]); errParse == nil && reset.Before(entry.next) {
-						entry.next = reset
+					if reset, errParse := time.Parse(time.RFC3339, quota.Signals["reset_time"]); errParse == nil && reset.After(now) {
+						target := reset.Add(antigravityQuotaJitterFunc(a.ID, reset))
+						if target.Before(entry.next) {
+							entry.next = target
+						}
+					}
+				}
+				if weekly, ok := firstWeeklyResetTimeForAuth(a); ok && weekly.After(now) {
+					target := weekly.Add(antigravityQuotaJitterFunc(a.ID, weekly))
+					if target.Before(entry.next) {
+						entry.next = target
 					}
 				}
 			} else if err != nil && ctx.Err() == nil {
@@ -215,4 +232,32 @@ func parseAntigravityQuotas(body []byte, now time.Time) (map[string]coreauth.Quo
 		}
 	}
 	return quotas, nil
+}
+
+func firstWeeklyResetTimeForAuth(a *coreauth.Auth) (time.Time, bool) {
+	if a == nil {
+		return time.Time{}, false
+	}
+	if a.Quota.Signals != nil {
+		if raw := a.Quota.Signals["weekly_quota_reset_at"]; raw != "" {
+			if t, err := time.Parse(time.RFC3339, raw); err == nil {
+				return t, true
+			}
+		}
+	}
+	if a.Attributes != nil {
+		if raw := a.Attributes["weekly_quota_reset_at"]; raw != "" {
+			if t, err := time.Parse(time.RFC3339, raw); err == nil {
+				return t, true
+			}
+		}
+	}
+	if a.Metadata != nil {
+		if raw, ok := a.Metadata["weekly_quota_reset_at"].(string); ok && raw != "" {
+			if t, err := time.Parse(time.RFC3339, raw); err == nil {
+				return t, true
+			}
+		}
+	}
+	return time.Time{}, false
 }

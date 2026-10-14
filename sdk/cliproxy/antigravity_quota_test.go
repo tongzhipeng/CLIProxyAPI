@@ -170,3 +170,65 @@ func TestAntigravityQuotaRefreshAccountIsolation(t *testing.T) {
 		t.Fatal("account quotas were shared")
 	}
 }
+
+func TestAntigravityQuotaRefresh_RefreshableAccountRestoresQuotaWithJitter(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	newReset := now.Add(7 * 24 * time.Hour) // New cycle reset in 7 days
+	var probeCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		probeCalls.Add(1)
+		fmt.Fprintf(w, `{"buckets":[{"modelId":"gemini-test","remainingFraction":1.0,"resetTime":%q}]}`, newReset.Format(time.RFC3339))
+	}))
+	defer server.Close()
+
+	// Injected deterministic 90s jitter for testing
+	origJitter := antigravityQuotaJitterFunc
+	antigravityQuotaJitterFunc = func(id string, base time.Time) time.Duration {
+		return 90 * time.Second
+	}
+	defer func() { antigravityQuotaJitterFunc = origJitter }()
+
+	m := coreauth.NewManager(nil, nil, nil)
+	rowan := &coreauth.Auth{
+		ID:         "rowan",
+		Provider:   "antigravity",
+		Status:     coreauth.StatusActive,
+		Attributes: map[string]string{"base_url": server.URL},
+		Metadata: map[string]any{
+			"access_token":          "rowan-token",
+			"weekly_quota_reset_at": now.Add(-5 * time.Minute).Format(time.RFC3339),
+		},
+	}
+	if _, err := m.Register(context.Background(), rowan); err != nil {
+		t.Fatal(err)
+	}
+
+	s := &Service{coreManager: m, cfg: &config.Config{Routing: internalconfig.RoutingConfig{Strategy: "quota-reset-first"}}}
+	next := make(map[string]antigravityQuotaRefreshEntry)
+
+	// First pass: trigger probe to refresh rowan's newly started cycle
+	s.refreshAntigravityQuotas(context.Background(), next, now)
+
+	if probeCalls.Load() != 1 {
+		t.Fatalf("expected 1 probe call, got %d", probeCalls.Load())
+	}
+
+	got, _ := m.GetByID("rowan")
+	state := got.ModelStates["gemini-test"]
+	if state == nil {
+		t.Fatal("gemini-test state not observed")
+	}
+	// Verify that real quota fraction and real reset time were restored
+	if state.Quota.Signals["remaining_fraction"] != "1" {
+		t.Fatalf("expected remaining_fraction 1, got %s", state.Quota.Signals["remaining_fraction"])
+	}
+	if state.Quota.Signals["reset_time"] != newReset.Format(time.RFC3339Nano) {
+		t.Fatalf("expected reset_time %s, got %s", newReset.Format(time.RFC3339Nano), state.Quota.Signals["reset_time"])
+	}
+
+	// Verify next refresh entry is scheduled with interval
+	entry := next["rowan"]
+	if !entry.next.Equal(now.Add(antigravityQuotaRefreshInterval)) {
+		t.Fatalf("expected next refresh at %v, got %v", now.Add(antigravityQuotaRefreshInterval), entry.next)
+	}
+}

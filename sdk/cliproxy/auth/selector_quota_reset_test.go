@@ -408,3 +408,107 @@ func TestQuotaResetFirstSelector_MetadataWeeklyReset(t *testing.T) {
 		t.Fatalf("Pick(metadata weekly) = %v, %v; want kevin", got, err)
 	}
 }
+
+func TestQuotaResetFirstSelector_RefreshableAccountPlacedLast_PrefersSecondExpiring(t *testing.T) {
+	now := time.Now()
+	// rowan was the first to expire, but its weekly reset just passed (5 minutes ago).
+	// It is now refreshable / entered a new cycle, so it must be placed last.
+	rowan := quotaResetTestAuth("rowan", nil, now)
+	rowan.Provider = "antigravity"
+	rowan.Metadata = map[string]any{
+		"weekly_quota_reset_at": now.Add(-5 * time.Minute).UTC().Format(time.RFC3339),
+	}
+	// kevin is the second expiring account in cache, with 2 hours left before reset.
+	kevin := quotaResetTestAuth("kevin", nil, now)
+	kevin.Provider = "antigravity"
+	kevin.Metadata = map[string]any{
+		"weekly_quota_reset_at": now.Add(2 * time.Hour).UTC().Format(time.RFC3339),
+	}
+	// george is the third expiring account in cache, with 24 hours left.
+	george := quotaResetTestAuth("george", nil, now)
+	george.Provider = "antigravity"
+	george.Metadata = map[string]any{
+		"weekly_quota_reset_at": now.Add(24 * time.Hour).UTC().Format(time.RFC3339),
+	}
+
+	// Pick should select kevin (the second expiring in cache) because rowan is refreshable and placed last.
+	got, err := (&QuotaResetFirstSelector{}).Pick(context.Background(), "antigravity", "gemini-3.8-flash-high", cliproxyexecutor.Options{}, []*Auth{rowan, kevin, george})
+	if err != nil || got == nil || got.ID != "kevin" {
+		t.Fatalf("Pick = %v, %v; want kevin (second expiring, since rowan is refreshable)", got, err)
+	}
+}
+
+func TestQuotaResetFirstSelector_RefreshableAccountPlacedAfterActiveUnknown(t *testing.T) {
+	now := time.Now()
+	// rowan's reset has passed (refreshable). ID starts with 'r'
+	rowan := quotaResetTestAuth("rowan", nil, now)
+	rowan.Provider = "antigravity"
+	rowan.Metadata = map[string]any{
+		"weekly_quota_reset_at": now.Add(-5 * time.Minute).UTC().Format(time.RFC3339),
+	}
+	// zach has no reset signals (active unknown). ID starts with 'z', sorts after 'rowan'
+	zach := quotaResetTestAuth("zach", nil, now)
+	zach.Provider = "antigravity"
+	zach.ModelStates = nil
+
+	// rowan sorts before zach by ID, but because rowan is refreshable (new cycle started, reset furthest away),
+	// rowan must be placed last (after active unknown zach).
+	got, err := (&QuotaResetFirstSelector{}).Pick(context.Background(), "antigravity", "gemini-3.8-flash-high", cliproxyexecutor.Options{}, []*Auth{rowan, zach})
+	if err != nil || got == nil || got.ID != "zach" {
+		t.Fatalf("Pick = %v, %v; want zach (active unknown beats refreshable rowan)", got, err)
+	}
+}
+
+func TestQuotaResetFirstSelector_RefreshableModelBucketPlacedLast(t *testing.T) {
+	now := time.Now()
+	rowan := quotaResetTestAuth("rowan", nil, now)
+	kevin := quotaResetTestAuth("kevin", nil, now)
+	rowan.Provider = "antigravity"
+	kevin.Provider = "antigravity"
+	// rowan's model bucket reset passed 5m ago
+	rowan.ModelStates = map[string]*ModelState{
+		"gemini-3.8-flash-tiered": {
+			Status: StatusActive,
+			Quota: QuotaState{
+				ObservedAt: now.Add(-10 * time.Minute),
+				Signals: map[string]string{
+					"reset_time":         now.Add(-5 * time.Minute).Format(time.RFC3339),
+					"remaining_fraction": "0.8",
+				},
+			},
+		},
+	}
+	// kevin's model bucket resets in 1h
+	kevin.ModelStates = map[string]*ModelState{
+		"gemini-3.8-flash-tiered": {
+			Status: StatusActive,
+			Quota: QuotaState{
+				ObservedAt: now,
+				Signals: map[string]string{
+					"reset_time":         now.Add(1 * time.Hour).Format(time.RFC3339),
+					"remaining_fraction": "0.8",
+				},
+			},
+		},
+	}
+
+	got, err := (&QuotaResetFirstSelector{}).Pick(context.Background(), "antigravity", "gemini-3.8-flash-high", cliproxyexecutor.Options{}, []*Auth{rowan, kevin})
+	if err != nil || got == nil || got.ID != "kevin" {
+		t.Fatalf("Pick = %v, %v; want kevin (rowan bucket is refreshable)", got, err)
+	}
+}
+
+func TestQuotaResetFirstSelector_AllRefreshableStillSelects(t *testing.T) {
+	now := time.Now()
+	rowan := quotaResetTestAuth("rowan", nil, now)
+	kevin := quotaResetTestAuth("kevin", nil, now)
+	rowan.Provider = "antigravity"
+	kevin.Provider = "antigravity"
+	rowan.Metadata = map[string]any{"weekly_quota_reset_at": now.Add(-10 * time.Minute).UTC().Format(time.RFC3339)}
+	kevin.Metadata = map[string]any{"weekly_quota_reset_at": now.Add(-5 * time.Minute).UTC().Format(time.RFC3339)}
+
+	got, err := (&QuotaResetFirstSelector{}).Pick(context.Background(), "antigravity", "gemini-3.8-flash-high", cliproxyexecutor.Options{}, []*Auth{rowan, kevin})
+	if err != nil || got == nil {
+		t.Fatalf("Pick(all refreshable) returned nil/error: %v, %v", got, err)
+	}
+}
