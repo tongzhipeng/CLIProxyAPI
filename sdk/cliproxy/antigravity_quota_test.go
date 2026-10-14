@@ -20,6 +20,11 @@ func TestAntigravityQuotaRefresh(t *testing.T) {
 	var calls atomic.Int32
 	var fail atomic.Bool
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1internal:retrieveUserQuotaSummary" {
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprint(w, `{"groups":[]}`)
+			return
+		}
 		calls.Add(1)
 		body, _ := io.ReadAll(r.Body)
 		if r.Method != http.MethodPost || r.URL.Path != "/v1internal:retrieveUserQuota" || string(body) != "{}" {
@@ -219,6 +224,11 @@ func TestAntigravityQuotaRefresh_RequestTriggeredProbeWithJitter(t *testing.T) {
 	newReset := now.Add(7 * 24 * time.Hour) // New cycle reset in 7 days
 	var probeCalls atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1internal:retrieveUserQuotaSummary" {
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprint(w, `{"groups":[]}`)
+			return
+		}
 		probeCalls.Add(1)
 		fmt.Fprintf(w, `{"buckets":[{"modelId":"gemini-test","remainingFraction":1.0,"resetTime":%q}]}`, newReset.Format(time.RFC3339))
 	}))
@@ -278,5 +288,135 @@ func TestAntigravityQuotaRefresh_RequestTriggeredProbeWithJitter(t *testing.T) {
 	}
 	if state.Quota.Signals["reset_time"] != newReset.Format(time.RFC3339Nano) {
 		t.Fatalf("expected reset_time %s, got %s", newReset.Format(time.RFC3339Nano), state.Quota.Signals["reset_time"])
+	}
+}
+
+func TestParseAntigravityQuotaSummary(t *testing.T) {
+	now := time.Date(2026, 10, 14, 0, 0, 0, 0, time.UTC)
+	body := `{
+		"groups": [
+			{
+				"displayName": "Gemini Models",
+				"buckets": [
+					{
+						"bucketId": "gemini-weekly",
+						"window": "weekly",
+						"resetTime": "2026-10-21T02:23:35Z",
+						"remainingFraction": 0.68
+					},
+					{
+						"bucketId": "gemini-5h",
+						"window": "5h",
+						"resetTime": "2026-10-14T16:00:26Z",
+						"remainingFraction": 0.63
+					}
+				]
+			},
+			{
+				"displayName": "Claude and GPT models",
+				"buckets": [
+					{
+						"bucketId": "3p-weekly",
+						"window": "weekly",
+						"resetTime": "2026-10-21T07:42:27Z",
+						"remainingFraction": 1.0
+					}
+				]
+			}
+		]
+	}`
+
+	summary, err := parseAntigravityQuotaSummary([]byte(body), now)
+	if err != nil {
+		t.Fatalf("parseAntigravityQuotaSummary failed: %v", err)
+	}
+	if len(summary) != 2 {
+		t.Fatalf("expected 2 weekly buckets, got %d", len(summary))
+	}
+	gw := summary["gemini-weekly"]
+	if gw.Signals["weekly_quota_reset_at"] == "" || gw.Signals["weekly_remaining_fraction"] != "0.68" {
+		t.Fatalf("gemini-weekly = %+v", gw)
+	}
+	p3 := summary["3p-weekly"]
+	if p3.Signals["weekly_quota_reset_at"] == "" || p3.Signals["weekly_remaining_fraction"] != "1" {
+		t.Fatalf("3p-weekly = %+v", p3)
+	}
+}
+
+func TestAntigravityQuotaRefresh_WithWeeklyQuotaSummary(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	weeklyReset := now.Add(24 * time.Hour)
+	fiveHourReset := now.Add(2 * time.Hour)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/v1internal:retrieveUserQuota" {
+			fmt.Fprintf(w, `{"buckets":[{"modelId":"gemini-3.8-flash-tiered","remainingFraction":0.9,"resetTime":%q}]}`, fiveHourReset.Format(time.RFC3339))
+			return
+		}
+		if r.URL.Path == "/v1internal:retrieveUserQuotaSummary" {
+			fmt.Fprintf(w, `{
+				"groups": [
+					{
+						"displayName": "Gemini Models",
+						"buckets": [
+							{
+								"bucketId": "gemini-weekly",
+								"window": "weekly",
+								"resetTime": %q,
+								"remainingFraction": 0.75
+							}
+						]
+					}
+				]
+			}`, weeklyReset.Format(time.RFC3339))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+
+	m := coreauth.NewManager(nil, nil, nil)
+	a := &coreauth.Auth{
+		ID:         "test-auth",
+		Provider:   "antigravity",
+		Status:     coreauth.StatusActive,
+		Attributes: map[string]string{"base_url": server.URL},
+		Metadata:   map[string]any{"access_token": "token"},
+	}
+	if _, err := m.Register(context.Background(), a); err != nil {
+		t.Fatal(err)
+	}
+
+	s := &Service{coreManager: m, cfg: &config.Config{Routing: internalconfig.RoutingConfig{Strategy: "quota-reset-first"}}}
+	next := make(map[string]antigravityQuotaRefreshEntry)
+	s.refreshAntigravityQuotas(context.Background(), next, now)
+
+	got, _ := m.GetByID("test-auth")
+	if got == nil {
+		t.Fatal("auth not found")
+	}
+
+	// 1. Model gemini-3.8-flash-tiered should have both 5-hour reset_time and weekly_quota_reset_at
+	modelState := got.ModelStates["gemini-3.8-flash-tiered"]
+	if modelState == nil {
+		t.Fatal("modelState nil")
+	}
+	if modelState.Quota.Signals["reset_time"] != fiveHourReset.Format(time.RFC3339Nano) {
+		t.Fatalf("model reset_time = %s, want %s", modelState.Quota.Signals["reset_time"], fiveHourReset.Format(time.RFC3339Nano))
+	}
+	if modelState.Quota.Signals["weekly_quota_reset_at"] != weeklyReset.Format(time.RFC3339Nano) {
+		t.Fatalf("model weekly_quota_reset_at = %s, want %s", modelState.Quota.Signals["weekly_quota_reset_at"], weeklyReset.Format(time.RFC3339Nano))
+	}
+	if modelState.Quota.Signals["weekly_remaining_fraction"] != "0.75" {
+		t.Fatalf("model weekly_remaining_fraction = %s, want 0.75", modelState.Quota.Signals["weekly_remaining_fraction"])
+	}
+
+	// 2. Auth level Signals and Metadata must record weekly_quota_reset_at
+	if got.Quota.Signals["weekly_quota_reset_at"] != weeklyReset.Format(time.RFC3339Nano) {
+		t.Fatalf("auth Signals weekly_quota_reset_at = %s, want %s", got.Quota.Signals["weekly_quota_reset_at"], weeklyReset.Format(time.RFC3339Nano))
+	}
+	if got.Metadata["weekly_quota_reset_at"] != weeklyReset.Format(time.RFC3339Nano) {
+		t.Fatalf("auth Metadata weekly_quota_reset_at = %v, want %s", got.Metadata["weekly_quota_reset_at"], weeklyReset.Format(time.RFC3339Nano))
 	}
 }

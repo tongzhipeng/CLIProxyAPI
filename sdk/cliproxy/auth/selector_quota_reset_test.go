@@ -550,3 +550,47 @@ func TestQuotaResetFirstSelector_NotifiesRefreshableAuthOnRequest(t *testing.T) 
 		t.Fatalf("expected no notification for unexpired auths, got %q", notifiedID)
 	}
 }
+
+func TestQuotaResetFirstSelector_WeeklyResetPrecedesFiveHourRollingBucket(t *testing.T) {
+	now := time.Now()
+	// tong has a weekly reset in 20 hours, and a 5-hour rolling bucket reset in 4 hours
+	tong := quotaResetTestAuth("tong", nil, now)
+	tong.Provider = "antigravity"
+	tong.ModelStates = map[string]*ModelState{
+		"gemini-3.8-flash-tiered": {
+			Status: StatusActive,
+			Quota: QuotaState{
+				ObservedAt: now,
+				Signals: map[string]string{
+					"reset_time":            now.Add(4 * time.Hour).Format(time.RFC3339),
+					"weekly_quota_reset_at": now.Add(20 * time.Hour).Format(time.RFC3339),
+					"remaining_fraction":    "0.8",
+				},
+			},
+		},
+	}
+
+	// rowan has a weekly reset in 7 days, but made a request recently so 5-hour rolling bucket resets in 1 hour
+	rowan := quotaResetTestAuth("rowan", nil, now)
+	rowan.Provider = "antigravity"
+	rowan.ModelStates = map[string]*ModelState{
+		"gemini-3.8-flash-tiered": {
+			Status: StatusActive,
+			Quota: QuotaState{
+				ObservedAt: now,
+				Signals: map[string]string{
+					"reset_time":            now.Add(1 * time.Hour).Format(time.RFC3339),
+					"weekly_quota_reset_at": now.Add(7 * 24 * time.Hour).Format(time.RFC3339),
+					"remaining_fraction":    "0.6",
+				},
+			},
+		},
+	}
+
+	// The selector must prefer tong (weekly reset in 20h) over rowan (weekly reset in 7d).
+	// Rowan's shorter rolling 5h bucket (1h) must NOT cause rowan to be preferred over tong.
+	got, err := (&QuotaResetFirstSelector{}).Pick(context.Background(), "antigravity", "gemini-3.8-flash-high", cliproxyexecutor.Options{}, []*Auth{rowan, tong})
+	if err != nil || got == nil || got.ID != "tong" {
+		t.Fatalf("Pick = %v, %v; want tong (weekly reset 20h outranks 7d despite 5h bucket)", got, err)
+	}
+}

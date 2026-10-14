@@ -86,23 +86,21 @@ func evaluateCandidateQuota(ctx context.Context, a *Auth, model string, index in
 		hasAnyReset bool
 	)
 
-	if weekly, ok := candidateWeeklyResetInfo(a, now); ok {
+	if weekly, ok := candidateModelOrAuthWeeklyResetInfo(ctx, a, model, now); ok {
 		bestReset = weekly
 		hasAnyReset = true
 	}
 
-	if modelReset, ok := candidateModelResetInfo(ctx, a, model, now); ok {
-		if !hasAnyReset {
+	if exhausted {
+		// For exhausted candidates, model reset represents the soonest recovery time back to active.
+		if modelReset, ok := candidateModelResetInfo(ctx, a, model, now); ok && !modelReset.refreshable {
 			bestReset = modelReset
 			hasAnyReset = true
-		} else if !bestReset.refreshable && !modelReset.refreshable {
-			// Both are in the future: choose the sooner upcoming reset.
-			if modelReset.reset.Before(bestReset.reset) {
-				bestReset = modelReset
-			}
-		} else if bestReset.refreshable && !modelReset.refreshable {
-			// Model bucket has a future observation that overrides past weekly window.
+		}
+	} else if !hasAnyReset {
+		if modelReset, ok := candidateModelResetInfo(ctx, a, model, now); ok {
 			bestReset = modelReset
+			hasAnyReset = true
 		}
 	}
 
@@ -144,6 +142,11 @@ func isQuotaExhausted(q QuotaState, now time.Time) bool {
 		return true
 	}
 	if raw, ok := q.Signals["remaining_fraction"]; ok && strings.TrimSpace(raw) != "" {
+		if val, err := strconv.ParseFloat(strings.TrimSpace(raw), 64); err == nil && val <= 0 {
+			return true
+		}
+	}
+	if raw, ok := q.Signals["weekly_remaining_fraction"]; ok && strings.TrimSpace(raw) != "" {
 		if val, err := strconv.ParseFloat(strings.TrimSpace(raw), 64); err == nil && val <= 0 {
 			return true
 		}
@@ -197,8 +200,20 @@ func tieredModelCandidates(model string) []string {
 }
 
 func candidateWeeklyResetInfo(a *Auth, now time.Time) (candidateResetInfo, bool) {
+	return candidateModelOrAuthWeeklyResetInfo(nil, a, "", now)
+}
+
+func candidateModelOrAuthWeeklyResetInfo(ctx context.Context, a *Auth, model string, now time.Time) (candidateResetInfo, bool) {
 	if a == nil {
 		return candidateResetInfo{}, false
+	}
+	if modelState := findModelStateForCandidate(ctx, a, model); modelState != nil {
+		if reset, ok := firstQuotaSignalTime(modelState.Quota.Signals, "weekly_quota_reset_at"); ok {
+			if reset.After(now) {
+				return candidateResetInfo{reset: reset, hasReset: true, refreshable: false}, true
+			}
+			return candidateResetInfo{reset: reset, hasReset: true, refreshable: true}, true
+		}
 	}
 	var (
 		rawTime time.Time
@@ -313,6 +328,9 @@ func IsAuthRefreshable(a *Auth, now time.Time) bool {
 	for _, state := range a.ModelStates {
 		if state == nil {
 			continue
+		}
+		if t, ok := firstQuotaSignalTime(state.Quota.Signals, "weekly_quota_reset_at"); ok && !t.After(now) {
+			return true
 		}
 		if t, ok := firstQuotaSignalTime(state.Quota.Signals, "reset_time"); ok && !t.After(now) {
 			return true

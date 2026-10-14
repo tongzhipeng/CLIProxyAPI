@@ -129,19 +129,10 @@ func (s *Service) refreshAntigravityQuotas(ctx context.Context, next map[string]
 }
 
 func (s *Service) fetchAntigravityQuotas(ctx context.Context, cfg *config.Config, a *coreauth.Auth, token string, now time.Time) (map[string]coreauth.QuotaState, error) {
-	// retrieveUserQuota is an account endpoint on production by default.
-	// Explicit base URLs still support private gateways and local test servers.
 	baseURL := resolveAntigravityModelBaseURL(a)
 	if baseURL == "" {
 		baseURL = antigravityModelBaseURLProd
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(baseURL, "/")+"/v1internal:retrieveUserQuota", strings.NewReader(`{}`))
-	if err != nil {
-		return nil, fmt.Errorf("invalid quota endpoint")
-	}
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", misc.AntigravityUserAgent())
 	proxyURL := a.ProxyURL
 	if proxyURL == "" && cfg != nil {
 		proxyURL = cfg.ProxyURL
@@ -155,6 +146,65 @@ func (s *Service) fetchAntigravityQuotas(ctx context.Context, cfg *config.Config
 		client.Transport = transport
 		defer transport.CloseIdleConnections()
 	}
+
+	var (
+		quotas        map[string]coreauth.QuotaState
+		summaryQuotas map[string]coreauth.QuotaState
+		errQuota      error
+		errSummary    error
+		g             errgroup.Group
+	)
+
+	projectID := antigravityProjectID(a)
+
+	g.Go(func() error {
+		quotas, errQuota = s.fetchAntigravityModelBuckets(ctx, client, baseURL, token, now)
+		return nil
+	})
+	g.Go(func() error {
+		summaryQuotas, errSummary = s.fetchAntigravityQuotaSummary(ctx, client, baseURL, token, projectID, now)
+		return nil
+	})
+	_ = g.Wait()
+
+	if errQuota != nil {
+		return nil, errQuota
+	}
+	if quotas == nil {
+		quotas = make(map[string]coreauth.QuotaState)
+	}
+	if errSummary == nil && len(summaryQuotas) > 0 {
+		mergeAntigravityQuotaSummary(quotas, summaryQuotas)
+	}
+	return quotas, nil
+}
+
+func antigravityProjectID(a *coreauth.Auth) string {
+	if a == nil {
+		return ""
+	}
+	if a.Metadata != nil {
+		if pid, ok := a.Metadata["project_id"].(string); ok && strings.TrimSpace(pid) != "" {
+			return strings.TrimSpace(pid)
+		}
+	}
+	if a.Attributes != nil {
+		if pid := strings.TrimSpace(a.Attributes["project_id"]); pid != "" {
+			return pid
+		}
+	}
+	return ""
+}
+
+func (s *Service) fetchAntigravityModelBuckets(ctx context.Context, client *http.Client, baseURL, token string, now time.Time) (map[string]coreauth.QuotaState, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(baseURL, "/")+"/v1internal:retrieveUserQuota", strings.NewReader(`{}`))
+	if err != nil {
+		return nil, fmt.Errorf("invalid quota endpoint")
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", misc.AntigravityUserAgent())
+
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("quota request failed")
@@ -173,6 +223,158 @@ func (s *Service) fetchAntigravityQuotas(ctx context.Context, cfg *config.Config
 		return nil, fmt.Errorf("invalid quota response body")
 	}
 	return parseAntigravityQuotas(body, now)
+}
+
+func (s *Service) fetchAntigravityQuotaSummary(ctx context.Context, client *http.Client, baseURL, token, projectID string, now time.Time) (map[string]coreauth.QuotaState, error) {
+	reqPayload := "{}"
+	if projectID != "" {
+		if b, err := json.Marshal(map[string]string{"project": projectID}); err == nil {
+			reqPayload = string(b)
+		}
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(baseURL, "/")+"/v1internal:retrieveUserQuotaSummary", strings.NewReader(reqPayload))
+	if err != nil {
+		return nil, fmt.Errorf("invalid quota summary endpoint")
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", misc.AntigravityUserAgent())
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("quota summary request failed: %w", err)
+	}
+	defer func() {
+		if errClose := resp.Body.Close(); errClose != nil {
+			log.Debug("antigravity quota summary: close response body failed")
+		}
+	}()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("quota summary HTTP status %d", resp.StatusCode)
+	}
+	const maxBody = 1 << 20
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBody+1))
+	if err != nil || len(body) > maxBody {
+		return nil, fmt.Errorf("invalid quota summary response body")
+	}
+	return parseAntigravityQuotaSummary(body, now)
+}
+
+func parseAntigravityQuotaSummary(body []byte, now time.Time) (map[string]coreauth.QuotaState, error) {
+	var response struct {
+		Groups []struct {
+			DisplayName string `json:"displayName"`
+			Buckets     []struct {
+				BucketID          string   `json:"bucketId"`
+				Window            string   `json:"window"`
+				ResetTime         string   `json:"resetTime"`
+				RemainingFraction *float64 `json:"remainingFraction"`
+			} `json:"buckets"`
+		} `json:"groups"`
+	}
+	if err := json.Unmarshal(body, &response); err != nil || response.Groups == nil || len(response.Groups) > 32 {
+		return nil, fmt.Errorf("invalid quota summary response")
+	}
+	summary := make(map[string]coreauth.QuotaState)
+	for _, group := range response.Groups {
+		for _, bucket := range group.Buckets {
+			if !strings.EqualFold(bucket.Window, "weekly") {
+				continue
+			}
+			resetStr := strings.TrimSpace(bucket.ResetTime)
+			if resetStr == "" {
+				continue
+			}
+			resetTime, err := time.Parse(time.RFC3339, resetStr)
+			if err != nil {
+				continue
+			}
+			signals := map[string]string{
+				"reset_time":            resetTime.UTC().Format(time.RFC3339Nano),
+				"weekly_quota_reset_at": resetTime.UTC().Format(time.RFC3339Nano),
+			}
+			if bucket.RemainingFraction != nil && *bucket.RemainingFraction >= 0 && *bucket.RemainingFraction <= 1 {
+				remStr := strconv.FormatFloat(*bucket.RemainingFraction, 'g', -1, 64)
+				signals["remaining_fraction"] = remStr
+				signals["weekly_remaining_fraction"] = remStr
+			}
+			bucketID := strings.ToLower(strings.TrimSpace(bucket.BucketID))
+			if bucketID == "" {
+				bucketID = strings.ToLower(strings.TrimSpace(group.DisplayName))
+			}
+			summary[bucketID] = coreauth.QuotaState{ObservedAt: now, Signals: signals}
+		}
+	}
+	return summary, nil
+}
+
+func mergeAntigravityQuotaSummary(quotas, summaryQuotas map[string]coreauth.QuotaState) {
+	var (
+		geminiReset   string
+		geminiRemain  string
+		p3Reset       string
+		p3Remain      string
+		earliestReset time.Time
+		earliestStr   string
+	)
+
+	for bucketID, qs := range summaryQuotas {
+		resetStr := qs.Signals["weekly_quota_reset_at"]
+		if resetStr == "" {
+			continue
+		}
+		t, err := time.Parse(time.RFC3339, resetStr)
+		if err == nil {
+			if earliestReset.IsZero() || t.Before(earliestReset) {
+				earliestReset = t
+				earliestStr = resetStr
+			}
+		}
+		if strings.Contains(bucketID, "gemini") {
+			geminiReset = resetStr
+			geminiRemain = qs.Signals["weekly_remaining_fraction"]
+		} else if strings.Contains(bucketID, "3p") || strings.Contains(bucketID, "claude") || strings.Contains(bucketID, "gpt") {
+			p3Reset = resetStr
+			p3Remain = qs.Signals["weekly_remaining_fraction"]
+		}
+	}
+
+	for model, qs := range quotas {
+		modelLower := strings.ToLower(model)
+		if strings.HasPrefix(modelLower, "gemini-") || strings.Contains(modelLower, "gemini") {
+			if geminiReset != "" {
+				if qs.Signals == nil {
+					qs.Signals = make(map[string]string)
+				}
+				qs.Signals["weekly_quota_reset_at"] = geminiReset
+				if geminiRemain != "" {
+					qs.Signals["weekly_remaining_fraction"] = geminiRemain
+				}
+				quotas[model] = qs
+			}
+		} else if strings.HasPrefix(modelLower, "claude-") || strings.HasPrefix(modelLower, "gpt-") || strings.Contains(modelLower, "claude") || strings.Contains(modelLower, "gpt") {
+			if p3Reset != "" {
+				if qs.Signals == nil {
+					qs.Signals = make(map[string]string)
+				}
+				qs.Signals["weekly_quota_reset_at"] = p3Reset
+				if p3Remain != "" {
+					qs.Signals["weekly_remaining_fraction"] = p3Remain
+				}
+				quotas[model] = qs
+			}
+		} else if earliestStr != "" {
+			if qs.Signals == nil {
+				qs.Signals = make(map[string]string)
+			}
+			qs.Signals["weekly_quota_reset_at"] = earliestStr
+			quotas[model] = qs
+		}
+	}
+
+	for k, v := range summaryQuotas {
+		quotas[k] = v
+	}
 }
 
 func parseAntigravityQuotas(body []byte, now time.Time) (map[string]coreauth.QuotaState, error) {

@@ -33,10 +33,29 @@ func (m *Manager) ObserveAntigravityQuotas(base *Auth, quotas map[string]QuotaSt
 			state.Quota.ClearObservationSignals()
 		}
 	}
+	var earliestWeekly time.Time
 	for model, quota := range quotas {
 		if state := ensureModelState(current, model); state != nil {
 			state.Quota = mergeQuotaObservation(state.Quota, quota)
 		}
+		if raw := quota.Signals["weekly_quota_reset_at"]; raw != "" {
+			if t, err := time.Parse(time.RFC3339, raw); err == nil {
+				if earliestWeekly.IsZero() || t.Before(earliestWeekly) {
+					earliestWeekly = t
+				}
+			}
+		}
+	}
+	if !earliestWeekly.IsZero() {
+		if current.Quota.Signals == nil {
+			current.Quota.Signals = make(map[string]string)
+		}
+		current.Quota.Signals["weekly_quota_reset_at"] = earliestWeekly.UTC().Format(time.RFC3339Nano)
+		current.Quota.ObservedAt = observedAt
+		if current.Metadata == nil {
+			current.Metadata = make(map[string]any)
+		}
+		current.Metadata["weekly_quota_reset_at"] = earliestWeekly.UTC().Format(time.RFC3339Nano)
 	}
 	current.Generation++
 	snapshot := current.Clone()
