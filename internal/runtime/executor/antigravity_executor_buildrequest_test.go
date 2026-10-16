@@ -11,6 +11,7 @@ import (
 
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
+	"github.com/tidwall/gjson"
 )
 
 func TestResolveAntigravityRequestBaseURL(t *testing.T) {
@@ -531,5 +532,74 @@ func assertSchemaSanitizedAndPropertyPreserved(t *testing.T, params map[string]a
 	}
 	if _, ok := mode["deprecated"]; ok {
 		t.Fatalf("deprecated should be removed from nested schema")
+	}
+}
+
+func TestResolveAntigravityArgonTier(t *testing.T) {
+	tests := []struct {
+		name       string
+		modelName  string
+		payload    string
+		wantModel  string
+		wantLevel  string
+		wantBudget int64
+	}{
+		{
+			name:       "bare gemini-4-argon defaults to high",
+			modelName:  "gemini-4-argon",
+			payload:    `{"request":{}}`,
+			wantModel:  "gemini-4-argon-high",
+			wantLevel:  "high",
+			wantBudget: 0,
+		},
+		{
+			name:       "gemini-4-argon with low level maps to low tier",
+			modelName:  "gemini-4-argon",
+			payload:    `{"request":{"generationConfig":{"thinkingConfig":{"thinkingLevel":"low"}}}}`,
+			wantModel:  "gemini-4-argon-low",
+			wantLevel:  "",
+			wantBudget: -1,
+		},
+		{
+			name:       "gemini-4-argon with medium budget maps to medium tier",
+			modelName:  "gemini-4-argon",
+			payload:    `{"request":{"generationConfig":{"thinkingConfig":{"thinkingBudget":8192}}}}`,
+			wantModel:  "gemini-4-argon-medium",
+			wantLevel:  "",
+			wantBudget: -1,
+		},
+		{
+			name:       "gemini-4-argon-low explicit model retains low tier",
+			modelName:  "gemini-4-argon-low",
+			payload:    `{"request":{}}`,
+			wantModel:  "gemini-4-argon-low",
+			wantLevel:  "",
+			wantBudget: -1,
+		},
+		{
+			name:       "unrelated model is untouched",
+			modelName:  "gemini-2.5-flash",
+			payload:    `{"request":{"generationConfig":{"thinkingConfig":{"thinkingBudget":1024}}}}`,
+			wantModel:  "gemini-2.5-flash",
+			wantLevel:  "",
+			wantBudget: 1024,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotModel, gotPayload := resolveAntigravityArgonTier(tt.modelName, []byte(tt.payload))
+			if gotModel != tt.wantModel {
+				t.Errorf("model = %q, want %q", gotModel, tt.wantModel)
+			}
+			level := gjson.GetBytes(gotPayload, argonThinkingLevelPath).String()
+			if level != tt.wantLevel {
+				t.Errorf("level = %q, want %q", level, tt.wantLevel)
+			}
+			budget := gjson.GetBytes(gotPayload, argonThinkingBudgetPath).Int()
+			if budget != tt.wantBudget {
+				t.Errorf("budget = %d, want %d", budget, tt.wantBudget)
+			}
+		})
 	}
 }
