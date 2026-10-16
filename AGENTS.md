@@ -13,8 +13,23 @@ go run ./cmd/server # Run dev server
 go test ./... # Run all tests
 go test -v -run TestName ./path/to/pkg # Run single test
 go build -o test-output ./cmd/server && rm test-output # Verify compile (REQUIRED after changes)
+
+# Release Pipeline (Strict Deployment Gates)
+./scripts/release.sh build   # Build candidate binary to bin/candidate/cliproxyapi with injected metadata
+./scripts/release.sh verify  # Verify candidate on isolated port with real flags, auth controls & endpoints
+./scripts/release.sh deploy  # Full deployment: build -> verify -> backup -> atomic replace -> restart -> healthcheck (auto-rollback on failure)
+./scripts/release.sh rollback # Emergency manual rollback to previous backup
 ```
 - Common flags: `--config <path>`, `--tui`, `--standalone`, `--local-model`, `--no-browser`, `--oauth-callback-port <port>`
+
+## Release Gates & Deployment Discipline (Mandatory)
+Unit tests passing does NOT prove the service can start and run under Homebrew/launchd configuration. All local service deployments MUST strictly execute via `./scripts/release.sh deploy`:
+1. **Development & Runtime Isolation**: Builds must write to candidate directory (`bin/candidate/cliproxyapi`). Never directly overwrite the currently running production binary. Keep existing service running during test and build.
+2. **Unified Entrypoint**: Version, commit SHA, build date, and default configuration path (`/opt/homebrew/etc/cliproxyapi.conf`) are centrally injected via ldflags. Development and release use the identical build recipe.
+3. **Real Startup Verification**: Candidate binary must start on an isolated high port with a temporary data directory and real startup flags. Real configuration loading, HTTP endpoints (`GET /`), and positive/negative authentication controls (valid key 200, missing/invalid key 401) must pass before deployment. `--help` or `--version` is strictly prohibited as startup acceptance.
+4. **Atomic Replacement & Automatic Rollback**: Upon verification, create a timestamped backup and `cliproxyapi.bak-latest`, atomically replace target via `mv -f`, and restart service via launchctl. If the process exits or fails post-restart health checks within the timeout, immediately and automatically restore the backup binary and restart.
+5. **Independent Execution**: The release script runs locally and independently from start to finish. Because proxy clients depend on this service, replacement, healthcheck, and rollback must never rely on intermediate external agent commands to recover.
+
 
 ## Config
 - Default config: `config.yaml` (template: `config.example.yaml`)
