@@ -112,6 +112,9 @@ func (s *Service) registerModelsForAuthWithCache(ctx context.Context, a *coreaut
 	case "antigravity":
 		models = registry.GetAntigravityModels()
 		models = applyExcludedModels(models, excluded)
+		if hints, ok := s.peekCachedAntigravityCapabilityHints(a); ok {
+			models = filterAntigravityModelsByCapabilities(models, hints)
+		}
 	case "claude":
 		models = registry.GetClaudeModels()
 		if entry := s.resolveConfigClaudeKey(a); entry != nil {

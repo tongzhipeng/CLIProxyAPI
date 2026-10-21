@@ -284,6 +284,12 @@ func TestRegisterModelsForAuth_AntigravityFetchesWebSearchCapability(t *testing.
 						"maxTokens": 1,
 						"maxOutputTokens": 2
 					},
+					"gemini-pro-agent": {
+						"displayName": "Gemini Pro Agent"
+					},
+					"gpt-oss-120b-medium": {
+						"displayName": "GPT OSS 120B"
+					},
 					"fetched-only-search-model": {
 						"displayName": "Fetched Only Search Model"
 					}
@@ -368,4 +374,190 @@ func TestRegisterModelsForAuth_AntigravityFetchesWebSearchCapability(t *testing.
 	if fetchedOnlyModel != nil {
 		t.Fatalf("fetched-only model should not be registered: %#v", fetchedOnlyModel)
 	}
+}
+
+func TestRegisterModelsForAuth_AntigravityFiltersUnavailableModels(t *testing.T) {
+	t.Run("excludes argon when not returned by upstream", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{
+				"models": {
+					"gemini-3.1-flash-lite": {
+						"displayName": "Gemini 3.1 Flash Lite"
+					},
+					"gemini-3.6-flash": {
+						"displayName": "Gemini 3.6 Flash"
+					}
+				},
+				"webSearchModelIds": ["gemini-3.1-flash-lite"]
+			}`))
+		}))
+		defer server.Close()
+
+		service := &Service{cfg: &config.Config{}}
+		auth := &coreauth.Auth{
+			ID:       "auth-antigravity-no-argon",
+			Provider: "antigravity",
+			Status:   coreauth.StatusActive,
+			Attributes: map[string]string{
+				"base_url": server.URL,
+			},
+			Metadata: map[string]any{
+				"access_token": "token",
+			},
+		}
+
+		registry := internalregistry.GetGlobalRegistry()
+		registry.UnregisterClient(auth.ID)
+		t.Cleanup(func() {
+			registry.UnregisterClient(auth.ID)
+		})
+
+		service.registerModelsForAuth(context.Background(), auth)
+		service.WaitAntigravityProbes()
+
+		models := registry.GetModelsForClient(auth.ID)
+		byID := make(map[string]*internalregistry.ModelInfo)
+		for _, m := range models {
+			if m != nil {
+				byID[m.ID] = m
+			}
+		}
+
+		if _, exists := byID["gemini-4-argon-high"]; exists {
+			t.Fatal("gemini-4-argon-high should NOT be registered when upstream lacks gemini-4-argon")
+		}
+		if _, exists := byID["gemini-4-argon-medium"]; exists {
+			t.Fatal("gemini-4-argon-medium should NOT be registered when upstream lacks gemini-4-argon")
+		}
+		if _, exists := byID["gemini-4-argon-low"]; exists {
+			t.Fatal("gemini-4-argon-low should NOT be registered when upstream lacks gemini-4-argon")
+		}
+		if _, exists := byID["gemini-3.1-flash-lite"]; !exists {
+			t.Fatal("expected gemini-3.1-flash-lite to be registered")
+		}
+		if _, exists := byID["gemini-3.6-flash-high"]; !exists {
+			t.Fatal("expected gemini-3.6-flash-high to be registered via base model gemini-3.6-flash")
+		}
+	})
+
+	t.Run("includes argon when upstream provides gemini-4-argon", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{
+				"models": {
+					"gemini-4-argon": {
+						"displayName": "Gemini 4 Argon"
+					},
+					"gemini-3.1-flash-lite": {
+						"displayName": "Gemini 3.1 Flash Lite"
+					}
+				},
+				"webSearchModelIds": ["gemini-4-argon"]
+			}`))
+		}))
+		defer server.Close()
+
+		service := &Service{cfg: &config.Config{}}
+		auth := &coreauth.Auth{
+			ID:       "auth-antigravity-with-argon",
+			Provider: "antigravity",
+			Status:   coreauth.StatusActive,
+			Attributes: map[string]string{
+				"base_url": server.URL,
+			},
+			Metadata: map[string]any{
+				"access_token": "token",
+			},
+		}
+
+		registry := internalregistry.GetGlobalRegistry()
+		registry.UnregisterClient(auth.ID)
+		t.Cleanup(func() {
+			registry.UnregisterClient(auth.ID)
+		})
+
+		service.registerModelsForAuth(context.Background(), auth)
+		service.WaitAntigravityProbes()
+
+		models := registry.GetModelsForClient(auth.ID)
+		byID := make(map[string]*internalregistry.ModelInfo)
+		for _, m := range models {
+			if m != nil {
+				byID[m.ID] = m
+			}
+		}
+
+		argonHigh, exists := byID["gemini-4-argon-high"]
+		if !exists {
+			t.Fatal("expected gemini-4-argon-high to be registered when upstream provides gemini-4-argon")
+		}
+		if !argonHigh.SupportsWebSearch {
+			t.Fatal("expected gemini-4-argon-high to support web search")
+		}
+		if _, exists := byID["gemini-4-argon-medium"]; !exists {
+			t.Fatal("expected gemini-4-argon-medium to be registered when upstream provides gemini-4-argon")
+		}
+		if _, exists := byID["gemini-4-argon-low"]; !exists {
+			t.Fatal("expected gemini-4-argon-low to be registered when upstream provides gemini-4-argon")
+		}
+	})
+
+	t.Run("uses cached hints synchronously on subsequent registrations", func(t *testing.T) {
+		fetchCount := 0
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			fetchCount++
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{
+				"models": {
+					"gemini-3.1-flash-lite": {
+						"displayName": "Gemini 3.1 Flash Lite"
+					}
+				}
+			}`))
+		}))
+		defer server.Close()
+
+		service := &Service{cfg: &config.Config{}}
+		auth := &coreauth.Auth{
+			ID:       "auth-antigravity-cached-hints",
+			Provider: "antigravity",
+			Status:   coreauth.StatusActive,
+			Attributes: map[string]string{
+				"base_url": server.URL,
+			},
+			Metadata: map[string]any{
+				"access_token": "token",
+			},
+		}
+
+		registry := internalregistry.GetGlobalRegistry()
+		registry.UnregisterClient(auth.ID)
+		t.Cleanup(func() {
+			registry.UnregisterClient(auth.ID)
+		})
+
+		// Initial registration triggers probe
+		service.registerModelsForAuth(context.Background(), auth)
+		service.WaitAntigravityProbes()
+		if fetchCount != 1 {
+			t.Fatalf("fetchCount = %d, want 1", fetchCount)
+		}
+
+		// Re-register: hints should be peeked from cache immediately
+		service.registerModelsForAuth(context.Background(), auth)
+		models := registry.GetModelsForClient(auth.ID)
+		byID := make(map[string]*internalregistry.ModelInfo)
+		for _, m := range models {
+			if m != nil {
+				byID[m.ID] = m
+			}
+		}
+		if _, exists := byID["gemini-4-argon-high"]; exists {
+			t.Fatal("gemini-4-argon-high should be filtered immediately via cached hints")
+		}
+		if _, exists := byID["gemini-3.1-flash-lite"]; !exists {
+			t.Fatal("gemini-3.1-flash-lite should be registered")
+		}
+	})
 }

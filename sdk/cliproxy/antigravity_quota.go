@@ -131,7 +131,7 @@ func (s *Service) refreshAntigravityQuotas(ctx context.Context, next map[string]
 func (s *Service) fetchAntigravityQuotas(ctx context.Context, cfg *config.Config, a *coreauth.Auth, token string, now time.Time) (map[string]coreauth.QuotaState, error) {
 	baseURL := resolveAntigravityModelBaseURL(a)
 	if baseURL == "" {
-		baseURL = antigravityModelBaseURLProd
+		baseURL = antigravityModelBaseURLDaily
 	}
 	proxyURL := a.ProxyURL
 	if proxyURL == "" && cfg != nil {
